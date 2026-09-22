@@ -1,0 +1,946 @@
+==================================================================
+BILLING API - DOKUMENTASI ENDPOINT
+==================================================================
+Base URL   : http://localhost/billing_api/
+Format     : {base_url}/{controller}/{function}
+Content-Type default : application/json (body dikirim sebagai JSON di raw body)
+Method default        : POST (kecuali disebutkan lain)
+
+Semua response berbentuk JSON:
+  { "code": 200, "result": ... }   -> sukses
+  { "code": 0,   "result": "pesan error" } -> gagal
+  { "code": 405, "result": "Method Not Allowed, gunakan POST" } -> method salah
+
+
+==================================================================
+SISTEM NOTIFIKASI & AUDIT (Api.php, history_hit_api_logs, history_query)
+==================================================================
+
+1) NOTIFIKASI KE SERVER PUSAT (application/libraries/Api.php)
+--------------------------------------------------------------
+HANYA action INSERT / EDIT / DELETE yang menyentuh 15 table berikut
+yang memicu notify (scope dipersempit dari sebelumnya "semua
+controller"): customer_point_history, customer_time,
+customer_time_history, history_saldo, ms_customer, ms_payment (tidak
+ada CRUD), ms_point_exchange, ms_product, ms_promo, ms_saldo,
+transaction, transaction_cafe, transaction_cafe_detail,
+transaksi_saldo, unit. Table lain (ms_role, ms_menu, role_access,
+absensi, ms_user, ms_master_price, category, table_active,
+keep_transaction, category_meja) TIDAK LAGI memicu notify.
+
+URL dibentuk otomatis per aksi:
+  {base_url}/{Module}/{function_name}
+
+Contoh: module "billing", function "payment"
+  -> http://localhost/gameon/Billing/payment
+(base_url sekarang: http://localhost/gameon/ - server tujuan "gameon"
+BELUM dibangun, ganti di application/libraries/Api.php properti
+$base_url kalau alamatnya sudah pasti. Detail lengkap payload per
+table ada di GAMEON_PAYLOAD_SPEC.txt)
+
+Body yang DIKIRIM ke server tujuan adalah request body ASLI (flat,
+field-nya sama persis seperti yang diterima endpoint aslinya) -
+BUKAN dibungkus dalam struktur "data". Ini penting karena server
+tujuan (gameon) menjalankan controller yang SAMA PERSIS dan
+membaca field langsung dari root body.
+
+6 table transaksional (customer_point_history, customer_time_history,
+history_saldo, transaction, transaction_cafe, transaksi_saldo) juga
+menyertakan field "branch" di payload - cabang milik user yang
+melakukan aksi (dicari dari ms_user.user_branch lewat paid_by lalu
+created_by, default 1). Lihat GAMEON_PAYLOAD_SPEC.txt section 5.
+
+CATATAN: ID auto_increment hasil insert TIDAK PERNAH dikirim ke
+gameon (notify bisa datang dari berbagai cabang dengan urutan
+auto_increment masing-masing, jadi ID tidak dipaksa sinkron - gameon
+generate ID sendiri sesuai data yang diterima). Lihat
+GAMEON_PAYLOAD_SPEC.txt section 4.
+
+CATATAN: field "password" dan "customer_pass" (plaintext) SEKARANG
+IKUT DIKIRIM di notify add_user/edit_user/add_customer/edit_customer
+(sebelumnya di-strip demi keamanan, sekarang sengaja dikirim atas
+permintaan eksplisit supaya gameon bisa simpan sendiri). ms_user CRUD
+sendiri sudah tidak lagi memicu notify (di luar 15 table), hanya
+ms_customer (add_customer/edit_customer) yang masih relevan.
+
+Pengecualian teknis: endpoint yang menerima multipart/form-data
+(add_product, edit_product, add_point_exchange, edit_point_exchange)
+- body notify dirakit manual dari field yang di-post (file gambar TIDAK
+ikut dikirim). CATATAN: karena notify() selalu kirim Content-Type:
+application/json sedangkan endpoint-endpoint ini di sisi server tujuan
+membaca lewat $_POST (butuh multipart/form-data), replikasi otomatis ke
+gameon untuk endpoint2 ini belum berfungsi penuh - field-nya
+terkirim tapi tidak terbaca di sisi sana.
+
+2) TRACKING STATUS UPLOAD PER ROW
+--------------------------------------------------------------
+Hampir semua table yang disentuh action insert/edit/delete di atas
+punya kolom tambahan: {nama_table}_upload_status ENUM('Y','N') DEFAULT 'N'
+- notify SUKSES (HTTP 2xx)                 -> kolom ini diubah jadi 'Y'
+- notify GAGAL (curl error / HTTP non-2xx) -> tetap 'N'
+
+3) HISTORY_HIT_API_LOGS (log setiap hit ke server pusat)
+--------------------------------------------------------------
+Setiap kali notify() dipanggil - SUKSES MAUPUN GAGAL - selalu dicatat
+1 baris ke table history_hit_api_logs:
+  module, action, function_name, status ('success'/'gagal'),
+  endpoint_url, payload (body lengkap+konteks yang dikirim),
+  ref_table, ref_id, http_code, response_message, created_at
+
+4) HISTORY_QUERY (log semua query database - global, semua model)
+--------------------------------------------------------------
+Terpisah dari sistem di atas: SEMUA query database tulis
+(INSERT/UPDATE/DELETE/REPLACE/TRUNCATE) yang dijalankan aplikasi -
+dari model MANAPUN, tanpa perlu setting apapun per model - otomatis
+tercatat ke table history_query lewat hook global (application/hooks/
+query_logger.php, dipasang di application/config/hooks.php):
+  query_text, query_type, table_name, status ('success'/'gagal'),
+  execution_time, error_message, created_at
+SELECT sengaja tidak dicatat (supaya table ini tidak cepat membengkak).
+
+
+==================================================================
+1. AUTH
+==================================================================
+
+POST /auth/login
+Deskripsi : Login user (karyawan/kasir/owner)
+Payload:
+{
+  "username": "admin",
+  "password": "admin123"
+}
+Response sukses:
+{
+  "code": 200,
+  "result": { "id": 1, "username": "admin", "userrole": "Owner", ... }
+}
+
+------------------------------------------------------------------
+GET /auth/add_absensi/{user_id}
+Deskripsi : Dipakai untuk SCAN QR CODE karyawan. Sekali di-scan toggle
+            otomatis check-in (kalau belum absen hari ini) atau
+            check-out (kalau sudah check-in). [INSERT]
+Contoh URL: GET /auth/add_absensi/5
+
+POST /auth/add_absensi
+Deskripsi : Input absensi manual oleh admin. [INSERT]
+Payload:
+{
+  "user_id": 5,
+  "absensi_date": "2026-08-12",
+  "absensi_time_in": "08:00:00",
+  "absensi_time_out": "17:00:00",
+  "absensi_note": "Shift pagi",
+  "created_by": "admin"
+}
+
+------------------------------------------------------------------
+POST /auth/edit_absensi
+Deskripsi : Update absensi (mis. isi jam keluar). [EDIT]
+Payload:
+{
+  "absensi_id": 12,
+  "absensi_time_out": "17:30:00",
+  "absensi_note": "Lembur 30 menit"
+}
+
+------------------------------------------------------------------
+POST /auth/delete_absensi
+Deskripsi : Hapus absensi (soft delete). [DELETE]
+Payload:
+{
+  "absensi_id": 12
+}
+
+------------------------------------------------------------------
+POST /auth/absensi_report
+Deskripsi : Laporan absensi (filter tanggal wajib, user_id opsional)
+Payload:
+{
+  "date_from": "2026-08-01",
+  "date_to": "2026-08-12",
+  "user_id": 5
+}
+
+
+==================================================================
+2. ACCESS (Hak akses / RBAC)
+==================================================================
+
+POST /access/role_list
+Deskripsi : Daftar role (dengan pagination)
+Payload:
+{ "page": 1, "per_page": 20 }
+
+POST /access/role_list_no_pagging
+Deskripsi : Daftar semua role tanpa pagination
+Payload: {}
+
+------------------------------------------------------------------
+POST /access/add_role
+Deskripsi : Tambah role baru. [INSERT]
+Payload:
+{ "role_name": "Supervisor" }
+
+POST /access/edit_role
+Deskripsi : Ubah role. [EDIT]
+Payload:
+{
+  "role_id": 4,
+  "role_name": "Supervisor Cafe",
+  "role_active": "Y"
+}
+
+POST /access/delete_role
+Deskripsi : Hapus role (gagal kalau masih dipakai user aktif). [DELETE]
+Payload:
+{ "role_id": 4 }
+
+------------------------------------------------------------------
+POST /access/menu_list_no_pagging
+Deskripsi : Daftar semua menu
+Payload: {}
+
+POST /access/add_menu
+Deskripsi : Tambah menu baru. [INSERT]
+Payload:
+{ "menu_code": "REPORT_STOCK", "menu_name": "Laporan Stok" }
+
+POST /access/edit_menu
+Deskripsi : Ubah menu. [EDIT]
+Payload:
+{
+  "menu_id": 9,
+  "menu_name": "Laporan Stok Produk",
+  "menu_active": "Y"
+}
+
+POST /access/delete_menu
+Deskripsi : Hapus menu. [DELETE]
+Payload:
+{ "menu_id": 9 }
+
+------------------------------------------------------------------
+POST /access/role_access
+Deskripsi : Lihat hak akses (view/add/edit/delete) 1 role untuk semua menu
+Payload:
+{ "role_id": 3 }
+
+POST /access/update_role_access
+Deskripsi : Simpan hak akses 1 role untuk banyak menu sekaligus. [EDIT]
+Payload:
+{
+  "role_id": 3,
+  "access": [
+    { "menu_id": 1, "can_view": "Y", "can_add": "Y", "can_edit": "N", "can_delete": "N" },
+    { "menu_id": 2, "can_view": "Y", "can_add": "N", "can_edit": "N", "can_delete": "N" }
+  ]
+}
+
+------------------------------------------------------------------
+POST /access/get_user_access
+Deskripsi : Hak akses milik 1 user (dipanggil setelah login)
+Payload:
+{ "user_id": 3 }
+
+
+==================================================================
+3. MASTER
+==================================================================
+
+--- User (karyawan/kasir) ---
+
+POST /master/user_list
+Payload: { "page": 1, "per_page": 20 }
+
+POST /master/add_user
+Deskripsi : Tambah user/karyawan baru. [INSERT]
+Payload:
+{
+  "username": "kasir02",
+  "password": "rahasia123",
+  "role": "Kasir"
+}
+
+POST /master/edit_user
+Deskripsi : Ubah user (semua field opsional, isi yang mau diubah saja). [EDIT]
+Payload:
+{
+  "user_id": 7,
+  "username": "kasir02b",
+  "password": "rahasiaBaru123",
+  "role": "Supervisor"
+}
+
+POST /master/delete_user
+Deskripsi : Hapus user. [DELETE]
+Payload:
+{ "user_id": 7 }
+
+POST /master/reset_pass_user
+Deskripsi : Reset password user ke default. [EDIT]
+Payload:
+{ "user_id": 7 }
+
+GET /master/user_qrcode/{user_id}
+Deskripsi : Generate QR code (image/png) untuk absensi karyawan, tinggal
+            dibuka di browser & di-print. Isi QR = URL GET absensi.
+Contoh URL: GET /master/user_qrcode/5
+
+
+--- Customer (member) ---
+Endpoint customer sudah dipindahkan seluruhnya (controller + model) keluar dari project
+billing_api ke project gameon (controller Recive_data, application/models/Master_model.php).
+Bukan lagi bagian dari API billing_api ini.
+
+CATATAN: master_model->get_customer_by_id() dan deduct_customer_saldo() (dipakai Billing.php
+untuk pembayaran metode "Potong Saldo") juga ikut dihapus dari billing_api. Alur bayar pakai
+saldo customer di Billing.php akan error sampai ditangani ulang secara terpisah.
+
+
+--- Harga (Price) ---
+
+POST /master/price_list
+Payload: {}
+
+POST /master/edit_price
+Deskripsi : Ubah harga (tier 1-5). [EDIT]
+Payload:
+{
+  "master_price_id": 3,
+  "price": 5000,
+  "price_2": 4500,
+  "price_3": 4000,
+  "price_4": 3500,
+  "price_5": 3000
+}
+
+
+--- Payment ---
+
+POST /master/get_payment_list
+Payload: {}
+
+
+--- Promo ---
+
+POST /master/promo_list
+Payload: { "page": 1, "per_page": 20 }
+
+POST /master/promo_list_no_pagging
+Payload: {}
+
+POST /master/add_promo
+Deskripsi : Tambah promo baru. [INSERT]
+Payload:
+{
+  "ms_promo_name": "Diskon Member 10%",
+  "ms_promo_tipe": "Diskon",
+  "ms_promo_value": 10
+}
+(ms_promo_tipe: "Diskon" atau "Fix")
+
+POST /master/edit_promo
+Deskripsi : Ubah promo. [EDIT]
+Payload:
+{
+  "ms_promo_id": 2,
+  "ms_promo_name": "Diskon Member 15%",
+  "ms_promo_tipe": "Diskon",
+  "ms_promo_value": 15
+}
+
+POST /master/delete_promo
+Deskripsi : Hapus promo (gagal kalau masih dipakai meja aktif). [DELETE]
+Payload:
+{ "ms_promo_id": 2 }
+
+
+--- Category (Produk) ---
+
+POST /master/category_list
+Payload: { "page": 1, "per_page": 20 }
+
+POST /master/category_list_no_pagging
+Payload: {}
+
+POST /master/add_category
+Deskripsi : Tambah kategori produk. [INSERT]
+Payload:
+{ "category_name": "Minuman" }
+
+POST /master/edit_category
+Deskripsi : Ubah kategori produk. [EDIT]
+Payload:
+{ "category_id": 3, "category_name": "Minuman Dingin" }
+
+POST /master/delete_category
+Deskripsi : Hapus kategori (gagal kalau masih dipakai produk aktif). [DELETE]
+Payload:
+{ "category_id": 3 }
+
+
+--- Unit (Satuan Produk) ---
+
+POST /master/unit_list
+Payload: { "page": 1, "per_page": 20 }
+
+POST /master/unit_list_no_pagging
+Payload: {}
+
+POST /master/add_unit
+Deskripsi : Tambah satuan produk. [INSERT]
+Payload:
+{ "unit_name": "Pcs" }
+
+POST /master/edit_unit
+Deskripsi : Ubah satuan produk. [EDIT]
+Payload:
+{ "unit_id": 2, "unit_name": "Botol" }
+
+POST /master/delete_unit
+Deskripsi : Hapus satuan (gagal kalau masih dipakai produk aktif). [DELETE]
+Payload:
+{ "unit_id": 2 }
+
+
+--- Product ---
+
+POST /master/product_list
+Payload: { "page": 1, "per_page": 20 }
+
+POST /master/add_product
+Deskripsi : Tambah produk baru. [INSERT]
+              *** PENTING: dikirim sebagai multipart/form-data (BUKAN JSON) ***
+              karena ada upload gambar (product_image bersifat opsional).
+Form-data fields:
+  category_id     = 3
+  unit_id         = 1
+  product_name    = "Kopi Susu"
+  product_price   = 15000
+  product_cogs    = 8000
+  product_stock   = 50
+  reduce_stock    = "Y"   (Y/N, stok berkurang otomatis saat terjual)
+  product_image   = (file, opsional: jpg/jpeg/png/gif, maks 2MB)
+
+POST /master/edit_product
+Deskripsi : Ubah produk (field opsional). [EDIT]
+              *** multipart/form-data (BUKAN JSON) ***
+Form-data fields:
+  product_id      = 10
+  category_id     = 3       (opsional)
+  unit_id         = 1       (opsional)
+  product_name    = "Kopi Susu Gula Aren"   (opsional)
+  product_price   = 17000   (opsional)
+  product_cogs    = 9000    (opsional)
+  product_stock   = 40      (opsional)
+  reduce_stock    = "Y"     (opsional)
+  product_image   = (file, opsional)
+
+POST /master/delete_product
+Deskripsi : Hapus produk. [DELETE]
+Payload:
+{ "product_id": 10 }
+
+
+--- Customer Time (waktu tersimpan / carry-over billing timer) ---
+
+POST /master/customer_time
+Deskripsi : Daftar waktu tersimpan (customer_id opsional: kosong = semua)
+Payload:
+{ "customer_id": 15 }
+
+POST /master/get_time_per_customer
+Deskripsi : Timer tersimpan milik 1 customer + nama category meja
+Payload:
+{ "customer_id": 15 }
+
+POST /master/get_save_customer_time
+Deskripsi : Sisa waktu tersimpan customer untuk category meja dari meja terpilih
+Payload:
+{ "customer_id": 15, "table_id": 4 }
+
+POST /master/save_customer_time
+Deskripsi : Simpan (akumulasi) sisa waktu billing timer customer. [INSERT]
+Payload:
+{
+  "customer_id": 15,
+  "category_meja_id": 2,
+  "time_remaining": "01:30:00",
+  "transaction_ref": "INV-20260812-0001",
+  "created_by": "kasir02"
+}
+
+POST /master/use_customer_time
+Deskripsi : Pakai (kurangi) saldo waktu tersimpan customer. [EDIT]
+Payload:
+{
+  "customer_id": 15,
+  "category_meja_id": 2,
+  "time_used": "01:00:00",
+  "transaction_ref": "INV-20260812-0002",
+  "created_by": "kasir02"
+}
+
+POST /master/check_time_save
+Deskripsi : Cek apakah fitur simpan waktu sedang aktif (setting global)
+Payload: {}
+
+POST /master/customer_time_history
+Deskripsi : Histori penyimpanan waktu 1 customer
+Payload:
+{ "customer_id": 15, "page": 1, "per_page": 20 }
+
+
+==================================================================
+4. BILLING (Meja / Transaksi Billing)
+==================================================================
+
+POST /billing/get_table_list
+Deskripsi : Daftar semua meja beserta statusnya
+Payload: {}
+
+------------------------------------------------------------------
+POST /billing/book_table
+Deskripsi : Booking / buka meja. [INSERT]
+Payload (mode Reguler):
+{
+  "table_id": 4,
+  "table_customer_id": 15,
+  "table_promo_id": 0,
+  "table_mode": "Reguler",
+  "table_start_time": "2026-08-12 10:00:00",
+  "created_by": "kasir02",
+  "use_saved_time": "N"
+}
+Payload (mode Timer):
+{
+  "table_id": 4,
+  "table_customer_id": 15,
+  "table_promo_id": 1,
+  "table_mode": "Timer",
+  "table_start_time": "2026-08-12 10:00:00",
+  "table_end_time": "2026-08-12 12:00:00",
+  "table_duration": "02:00:00",
+  "created_by": "kasir02",
+  "use_saved_time": "N"
+}
+(use_saved_time: "Y" -> table_duration dipotong dari saldo waktu tersimpan customer, hanya untuk mode Timer)
+
+POST /billing/edit_table_active
+Deskripsi : Ubah status aktif meja. [EDIT]
+Payload:
+{ "table_id": 4, "table_active": 1 }
+
+POST /billing/setting_table
+Deskripsi : Lihat setting semua meja
+Payload: {}
+
+POST /billing/update_setting_table
+Deskripsi : Ubah setting meja (relay, nomor, category). [EDIT]
+Payload:
+{
+  "table_id": 4,
+  "table_relay": 2,
+  "table_number": "PS-04",
+  "table_category": 1
+}
+
+POST /billing/reset_table
+Deskripsi : Reset SEMUA meja (mis. setelah restart sistem). [EDIT]
+Payload: {}
+
+POST /billing/transaction_list
+Payload: { "page": 1, "per_page": 20 }
+
+POST /billing/transaction_saldo_list
+Payload: { "page": 1, "per_page": 20 }
+
+POST /billing/total_transaction_per_cashier
+Payload: { "user_id": 7 }
+
+POST /billing/transaction_detail
+Payload: { "transaction_id": 100 }
+
+------------------------------------------------------------------
+POST /billing/cancel_table
+Deskripsi : Batalkan meja yang sedang aktif/dibooking. [DELETE]
+Payload:
+{
+  "table_id": 4,
+  "created_by": "kasir02",
+  "paid_by": 7
+}
+
+POST /billing/add_duration
+Deskripsi : Tambah durasi meja mode Timer. [EDIT]
+Payload:
+{ "table_id": 4, "additional_duration": "01:00:00" }
+
+POST /billing/move_table
+Deskripsi : Pindahkan sesi billing dari 1 meja ke meja lain (category sama). [EDIT]
+Payload:
+{ "from_table_id": 4, "to_table_id": 6 }
+
+------------------------------------------------------------------
+POST /billing/payment
+Deskripsi : Proses pembayaran / checkout meja. [INSERT]
+Payload (contoh lengkap, mode Reguler, bayar tunai):
+{
+  "transaction_mode": "Reguler",
+  "transaction_customer_id": 15,
+  "transaction_payment_id": 1,
+  "transaction_promo_id": 0,
+  "transaction_start_time": "2026-08-12 10:00:00",
+  "transaction_end_time": "2026-08-12 11:30:00",
+  "transaction_duration": "01:30:00",
+  "transaction_sub_total": 45000,
+  "transaction_tax": 4500,
+  "transaction_total_bill": 49500,
+  "transaction_table": 4,
+  "created_by": "kasir02",
+  "paid_by": 7,
+  "save_time": "N",
+  "used_save_time": "N"
+}
+Catatan:
+- transaction_payment_id yang payment_name-nya "Potong Saldo" otomatis
+  memotong saldo customer (transaction_customer_id wajib diisi).
+- save_time: "Y" -> sisa waktu meja disimpan sebagai saldo waktu customer.
+- used_save_time: "Y" -> transaction_duration dipotong dari saldo waktu
+  tersimpan customer (tidak ada tagihan baru).
+- mode Timer: sub_total/tax/total_bill dihitung ulang otomatis oleh
+  backend, payload nominal hanya dipakai kalau mode Reguler.
+
+POST /billing/calculation_price
+Deskripsi : Hitung estimasi tagihan meja saat ini (belum checkout)
+Payload:
+{ "table_id": 4 }
+
+
+==================================================================
+5. CAFE (Transaksi Cafe / Produk)
+==================================================================
+
+POST /cafe/transaction_cafe_list
+Payload: { "page": 1, "per_page": 20 }
+
+------------------------------------------------------------------
+POST /cafe/save_transaction_cafe
+Deskripsi : Simpan transaksi penjualan cafe. [INSERT]
+Payload:
+{
+  "customer_id": 15,
+  "promo_id": 0,
+  "payment_id": 1,
+  "table": 4,
+  "tax": 0,
+  "created_by": "kasir02",
+  "paid_by": 7,
+  "items": [
+    { "product_id": 10, "qty": 2 },
+    { "product_id": 12, "qty": 1 }
+  ]
+}
+(payment_id yang payment_name-nya "Potong Saldo" otomatis memotong saldo
+customer, customer_id wajib diisi untuk itu)
+
+------------------------------------------------------------------
+POST /cafe/keep_transaction
+Deskripsi : Simpan transaksi cafe sementara (belum dibayar / "keep").
+            Kirim tanpa keep_transaction_id = buat baru [INSERT].
+            Kirim dengan keep_transaction_id = update transaksi keep
+            yang sudah ada [EDIT].
+Payload (baru):
+{
+  "name": "Meja 4 - Budi",
+  "customer_id": 15,
+  "promo_id": 0,
+  "payment_id": 1,
+  "table": 4,
+  "tax": 0,
+  "created_by": "kasir02",
+  "items": [
+    { "product_id": 10, "qty": 2 }
+  ]
+}
+Payload (update transaksi keep yang sudah ada):
+{
+  "keep_transaction_id": 5,
+  "name": "Meja 4 - Budi",
+  "items": [
+    { "product_id": 10, "qty": 3 },
+    { "product_id": 15, "qty": 1 }
+  ]
+}
+
+POST /cafe/select_keep_transaction
+Deskripsi : Lihat 1 atau semua transaksi keep (keep_transaction_id opsional)
+Payload:
+{ "keep_transaction_id": 5 }
+
+------------------------------------------------------------------
+POST /cafe/delete_keep_transaction
+Deskripsi : Hapus transaksi keep. [DELETE]
+Payload:
+{ "keep_transaction_id": 5 }
+
+
+==================================================================
+6. SETTING
+==================================================================
+
+--- Point Exchange (Redeem Hadiah) ---
+
+POST /setting/point_exchange
+Payload: { "page": 1, "per_page": 20 }
+
+POST /setting/add_point_exchange
+Deskripsi : Tambah hadiah redeem poin. [INSERT]
+              *** multipart/form-data (BUKAN JSON) ***
+Form-data fields:
+  ms_point_exchange_name   = "Voucher Rp 10.000"
+  ms_point_exchange_point  = 100
+  ms_point_exchange_desc   = "Voucher belanja Rp 10.000"
+  ms_point_exchange_image  = (file, opsional)
+
+POST /setting/edit_point_exchange
+Deskripsi : Ubah hadiah redeem poin. [EDIT]
+              *** multipart/form-data (BUKAN JSON) ***
+Form-data fields:
+  ms_point_exchange_id     = 3
+  ms_point_exchange_name   = "Voucher Rp 15.000"   (opsional)
+  ms_point_exchange_point  = 150                    (opsional)
+  ms_point_exchange_desc   = "Voucher belanja Rp 15.000" (opsional)
+  ms_point_exchange_active = "Y"                    (opsional, Y/N)
+  ms_point_exchange_image  = (file, opsional)
+
+POST /setting/delete_point_exchange
+Deskripsi : Hapus hadiah redeem poin. [DELETE]
+Payload:
+{ "ms_point_exchange_id": 3 }
+
+
+--- Saldo (Pilihan Nominal Top Up) ---
+
+POST /setting/saldo_list
+Payload: { "page": 1, "per_page": 20 }
+
+POST /setting/saldo_list_no_pagging
+Payload: {}
+
+POST /setting/add_saldo
+Deskripsi : Tambah pilihan nominal top up saldo. [INSERT]
+Payload:
+{
+  "ms_saldo_nominal": 100000,
+  "ms_saldo_price": 100000,
+  "ms_saldo_discount": 5000
+}
+
+POST /setting/edit_saldo
+Deskripsi : Ubah pilihan saldo. [EDIT]
+Payload:
+{
+  "ms_saldo_id": 2,
+  "ms_saldo_nominal": 100000,
+  "ms_saldo_price": 95000,
+  "ms_saldo_discount": 5000,
+  "ms_saldo_active": "Y"
+}
+
+POST /setting/delete_saldo
+Deskripsi : Hapus pilihan saldo. [DELETE]
+Payload:
+{ "ms_saldo_id": 2 }
+
+
+--- Category Meja ---
+
+POST /setting/category_meja
+Payload: { "page": 1, "per_page": 20 }
+
+POST /setting/add_category_meja
+Deskripsi : Tambah kategori meja. [INSERT]
+Payload:
+{ "category_meja_name": "PS4 Reguler", "category_meja_price": 1 }
+(category_meja_price: 1-5, menentukan tier harga)
+
+POST /setting/edit_category_meja
+Deskripsi : Ubah kategori meja. [EDIT]
+Payload:
+{
+  "category_meja_id": 2,
+  "category_meja_name": "PS5 VIP",
+  "category_meja_price": 3,
+  "category_meja_active": "Y"
+}
+
+POST /setting/delete_category_meja
+Deskripsi : Hapus kategori meja. [DELETE]
+Payload:
+{ "category_meja_id": 2 }
+
+
+==================================================================
+7. REPORT
+==================================================================
+Semua endpoint report menerima parameter "type" (opsional):
+  - "view"  (default) -> JSON
+  - "excel"           -> download file .xlsx
+  - "pdf"             -> download file .pdf
+
+POST /report/get_transaction_today_by_cashier
+Payload: { "user_id": 7 }
+
+POST /report/total_transaction_today_by_cashier
+Deskripsi : Sama seperti di atas, dipecah per jenis pembayaran
+Payload: { "user_id": 7 }
+
+------------------------------------------------------------------
+POST /report/billing_report
+Deskripsi : Laporan transaksi billing
+Payload:
+{
+  "date_from": "2026-08-01",
+  "date_to": "2026-08-12",
+  "customer_id": 15,
+  "paid_by": 7,
+  "type": "view"
+}
+
+POST /report/cafe_report
+Deskripsi : Laporan transaksi cafe (dengan detail item per nota)
+Payload:
+{
+  "date_from": "2026-08-01",
+  "date_to": "2026-08-12",
+  "type": "excel"
+}
+
+POST /report/saldo_report
+Deskripsi : Laporan transaksi top up saldo
+Payload:
+{
+  "date_from": "2026-08-01",
+  "date_to": "2026-08-12",
+  "type": "pdf"
+}
+
+POST /report/stock
+Deskripsi : Laporan stok produk
+Payload:
+{ "type": "view" }
+
+
+==================================================================
+8. PURCHASE (Pembelian Stok dari Supplier)
+==================================================================
+*** CATATAN: purchase_add dan purchase_cancel BELUM terhubung ke
+    notifikasi Api.php (belum ada $this->api->notify()), dan table
+    "purchase" belum punya kolom purchase_upload_status. Beri tahu
+    kalau ini perlu ditambahkan juga. ***
+
+POST /purchase/purchase_list
+Deskripsi : Tanpa purchase_id = daftar (pagination). Dengan purchase_id
+            = detail 1 purchase beserta item-nya
+Payload:
+{ "page": 1, "per_page": 20 }
+atau
+{ "purchase_id": 8 }
+
+POST /purchase/list_product_purchase
+Deskripsi : Daftar produk yang bisa dibelikan (reduce_stock = Y)
+Payload: {}
+
+------------------------------------------------------------------
+POST /purchase/purchase_add
+Deskripsi : Catat pembelian stok dari supplier. [INSERT]
+Payload:
+{
+  "supplier": "PT Sumber Makmur",
+  "discount": 10000,
+  "created_by": "admin",
+  "items": [
+    { "product_id": 10, "qty": 50, "price": 7500 },
+    { "product_id": 12, "qty": 30, "price": 5000 }
+  ]
+}
+
+POST /purchase/purchase_cancel
+Deskripsi : Batalkan purchase. [DELETE]
+Payload:
+{
+  "purchase_id": 8,
+  "cancelled_by": "admin"
+}
+
+
+==================================================================
+9. MAINTENANCE (Reset Data - BERBAHAYA/PERMANEN)
+==================================================================
+
+POST /maintenance/reset_data
+Deskripsi : Reset SELURUH data transaksional (customer, product,
+            transaction, absensi, purchase, dll) ke kosong. HANYA
+            menyisakan data master/konfigurasi: category, category_meja,
+            minute_setting, ms_master_price, ms_menu, ms_payment,
+            ms_role, ms_saldo, ms_user, role_access, save_time_setting,
+            unit. table_active TIDAK di-truncate, hanya kolom sesi
+            booking-nya yang dikosongkan (table_customer_id,
+            table_promo_id, table_mode, table_start_time, table_end_time,
+            table_duration, table_bill, table_active -> semua direset/0).
+            [DELETE]
+
+            *** AKSI INI PERMANEN & TIDAK BISA DIBATALKAN ***
+            Wajib kirim confirm: "RESET", kalau tidak akan ditolak.
+
+Payload:
+{ "confirm": "RESET" }
+
+Response sukses:
+{
+  "code": 200,
+  "result": "Seluruh data transaksional berhasil direset",
+  "truncated_tables": ["absensi", "customer_point_history", "customer_time",
+    "customer_time_history", "history_hit_api_logs", "history_query",
+    "history_saldo", "keep_transaction", "keep_transaction_detail",
+    "movement_stock", "ms_customer", "ms_point_exchange", "ms_product",
+    "ms_promo", "purchase", "purchase_detail", "transaction",
+    "transaction_cafe", "transaction_cafe_detail", "transaksi_saldo"]
+}
+
+Response ditolak (confirm tidak dikirim/salah):
+{
+  "code": 0,
+  "result": "Aksi ini akan menghapus seluruh data transaksional secara permanen. Kirim confirm: \"RESET\" untuk melanjutkan."
+}
+
+
+==================================================================
+RINGKASAN NOTIFIKASI (Api.php) PER MODULE
+==================================================================
+module "auth"        : add_absensi (insert), edit_absensi (edit), delete_absensi (delete)
+module "access"      : add_role/edit_role/delete_role, add_menu/edit_menu/delete_menu,
+                        update_role_access (edit)
+module "master"      : add_user/edit_user/delete_user, reset_pass_user (edit),
+                        add_customer/edit_customer/delete_customer, reset_pass_customer (edit),
+                        add_customer_saldo (insert), edit_price (edit),
+                        add_promo/edit_promo/delete_promo,
+                        add_category/edit_category/delete_category,
+                        add_unit/edit_unit/delete_unit,
+                        add_product/edit_product/delete_product,
+                        save_customer_time (insert), use_customer_time (edit)
+module "billing"     : book_table (insert), edit_table_active (edit),
+                        update_setting_table (edit), reset_table (edit),
+                        cancel_table (delete), add_duration (edit),
+                        move_table (edit), payment (insert)
+module "cafe"        : save_transaction_cafe (insert), keep_transaction (insert/edit),
+                        delete_keep_transaction (delete)
+module "setting"     : add_point_exchange/edit_point_exchange/delete_point_exchange,
+                        add_saldo/edit_saldo/delete_saldo,
+                        add_category_meja/edit_category_meja/delete_category_meja
+module "maintenance" : reset_data (delete)
+
+module "purchase"    : BELUM ada (lihat catatan di section 8)

@@ -1,0 +1,551 @@
+==================================================================
+GAMEON - SPESIFIKASI PAYLOAD NOTIFIKASI (dari billing_api)
+==================================================================
+Dokumen ini adalah acuan untuk membangun aplikasi "gameon" (server
+tujuan notifikasi billing_api). Berisi persis payload apa yang akan
+dikirim billing_api untuk tiap table yang di-sinkronkan, supaya
+controller/endpoint gameon bisa dibangun agar cocok dengan kontrak ini.
+
+STATUS: gameon BELUM dibangun. billing_api SUDAH mengirim curl ke
+alamat di bawah - saat ini semua akan gagal (connection refused/404)
+karena belum ada yang listen, dan itu TIDAK APA-APA (lihat "Kontrak
+Umum" - kegagalan tidak pernah mengganggu proses utama billing_api).
+
+
+==================================================================
+KONTRAK UMUM
+==================================================================
+
+1) BASE URL & ROUTING
+--------------------------------------------------------------
+  Base URL saat ini : http://localhost/gameon/
+  (diset di application/libraries/Api.php, properti $base_url -
+  ganti sendiri kalau alamat gameon yang sebenarnya berbeda)
+
+  URL per aksi dibentuk otomatis:
+    {base_url}/{Module}/{function_name}
+
+  Module di-ucfirst() jadi nama controller CI.
+  Contoh: module "billing", function "payment"
+    -> http://localhost/gameon/Billing/payment
+
+  Supaya paling gampang, gameon idealnya dibangun dengan struktur
+  controller/function yang MIRIP billing_api (nama controller & nama
+  function sama persis dengan yang ada di dokumen ini), tinggal baca
+  field dari root body.
+
+2) METHOD, HEADER, BODY
+--------------------------------------------------------------
+  Method       : POST
+  Content-Type : application/json
+  Body         : JSON flat/rata (field langsung di root, BUKAN
+                 dibungkus di dalam "data"). Semua contoh payload di
+                 bawah adalah PERSIS bentuk body yang dikirim.
+
+3) RESPONSE YANG DIHARAPKAN gameon
+--------------------------------------------------------------
+  billing_api menganggap notify SUKSES kalau:
+    - HTTP status 2xx, DAN
+    - body response adalah JSON dengan field "code" == 200
+
+  Contoh response sukses yang harus dibalas gameon:
+    { "code": 200, "result": "OK" }
+
+  Kalau gameon balas code selain 200 (atau HTTP non-2xx, atau body
+  bukan JSON), billing_api mencatatnya sebagai gagal di
+  history_hit_api_logs TAPI proses utama billing_api tetap jalan
+  normal (fire-and-forget, tidak pernah mem-block user).
+  Timeout: connect 3 detik, total 5 detik.
+
+4) TIDAK ADA SINKRONISASI ID AUTO_INCREMENT (PENTING)
+--------------------------------------------------------------
+  billing_api TIDAK PERNAH mengirim ID auto_increment milik row yang
+  baru saja di-insert. Kolom primary key (mis. ms_promo_id,
+  transaksi_saldo_id, customer_point_history_id, dst) SENGAJA TIDAK
+  ada di body notify untuk action "insert".
+
+  Alasan: notify ke gameon bisa datang dari BERBAGAI CABANG (masing-
+  masing instance billing_api punya urutan auto_increment sendiri-
+  sendiri). Kalau ID dipaksa sama antara billing_api dan gameon, ID
+  dari cabang berbeda bisa bentrok/salah timpa di gameon. Jadi:
+  gameon HARUS generate ID auto_increment SENDIRI, independen,
+  berdasarkan data yang diterima saja - bukan meniru ID billing_api.
+
+  Konsekuensi: kalau body notify punya field yang me-refer ke row LAIN
+  yang baru dibuat di request yang sama (contoh: "transaksi_saldo_id"
+  di payload history_saldo, atau "transaction_cafe_id" di payload
+  transaction_cafe_detail, atau "ref_id" yang menunjuk transaction_id/
+  table_id) - nilai itu tetap nilai ID billing_api (BUKAN hasil auto-
+  inject, tapi memang bagian data yang dikirim sengaja untuk konteks
+  relasi). Karena ID gameon sendiri kemungkinan besar BEDA dengan ID
+  billing_api, field referensi ini TIDAK BISA langsung dipakai sebagai
+  foreign key ke primary key gameon sendiri - sarankan disimpan di
+  kolom terpisah (mis. "source_ref_id") murni untuk penelusuran/audit,
+  bukan sebagai foreign key aktif ke row gameon.
+
+  Untuk action "edit"/"delete": ID yang dikirim (mis. "customer_id",
+  "ms_promo_id") adalah ID yang MEMANG SUDAH ADA dari request client
+  asli (dipakai untuk menunjuk row yang mau diubah/dihapus) - bukan ID
+  baru hasil auto_increment. Field ini tetap dikirim apa adanya karena
+  diperlukan untuk tahu row MANA yang dimaksud. Catatan: karena ID
+  billing_api dan ID gameon tidak dijamin sama (lihat di atas), fitur
+  edit/delete lewat notify HANYA akan benar di gameon kalau gameon
+  punya cara sendiri untuk mapping ID billing_api -> ID gameon
+  (mis. simpan "source_ref_id" di atas dan JOIN lewat situ), bukan
+  asumsi ID-nya identik.
+
+5) KOLOM "branch" (CABANG)
+--------------------------------------------------------------
+  6 table di bawah (ditandai "CABANG" di masing-masing section) selalu
+  menyertakan field "branch" (integer) di payload-nya - menunjukkan
+  cabang mana yang melakukan aksi tsb:
+    customer_point_history, customer_time_history, history_saldo,
+    transaction, transaction_cafe, transaksi_saldo
+
+  Cara billing_api menentukan branch:
+    a. Cari ms_user.user_branch lewat user_id di field "paid_by" kalau ada
+    b. Kalau tidak ada/tidak ketemu, cari lewat ms_user.username = "created_by"
+    c. Kalau keduanya gagal, default ke 1
+
+  gameon disarankan punya table ms_user juga dengan kolom user_branch
+  (default 1) dan table-table di atas juga punya kolom branch (default 1),
+  supaya data yang diterima bisa langsung disimpan apa adanya.
+
+6) SCOPE - HANYA 15 TABLE INI YANG DI-NOTIFY
+--------------------------------------------------------------
+  billing_api HANYA mengirim notify untuk insert/update/delete ke:
+    1.  customer_point_history  (CABANG)
+    2.  customer_time
+    3.  customer_time_history   (CABANG)
+    4.  history_saldo           (CABANG)
+    5.  ms_customer
+    6.  ms_payment               -- TIDAK ADA CRUD di app (read-only,
+                                     tidak pernah ada notify utk table ini)
+    7.  ms_point_exchange
+    8.  ms_product
+    9.  ms_promo
+    10. ms_saldo
+    11. transaction              (CABANG)
+    12. transaction_cafe         (CABANG)
+    13. transaction_cafe_detail
+    14. transaksi_saldo          (CABANG)
+    15. unit
+
+  Table lain (ms_role, ms_menu, role_access, absensi, ms_user CRUD,
+  ms_master_price, category, table_active, keep_transaction,
+  category_meja) TIDAK PERNAH memicu notify ke gameon.
+
+
+==================================================================
+DAFTAR PAYLOAD PER TABLE
+==================================================================
+Catatan pembacaan: field yang ditandai "(FK - lihat kontrak #4)" adalah
+ID milik row LAIN yang dibuat billing_api - bukan primary key row yang
+sedang di-insert, dan bukan hasil auto-inject. Field ini murni data
+referensi, simpan sebagai kolom biasa (bukan foreign key) di gameon.
+
+------------------------------------------------------------------
+1. customer_point_history  [INSERT only - CABANG]
+------------------------------------------------------------------
+Dikirim dari 2 titik berbeda, table "customer_point_history":
+
+a) module=billing, function=book_table_customer_point_history
+   URL: POST /Billing/book_table_customer_point_history
+   Dipicu saat: booking meja mode Timer dengan member terisi (poin
+   booking dihitung dari table_point x durasi)
+   Body:
+   {
+     "customer_id": 6,
+     "ref_type": "Booking",
+     "ref_id": 12,                 // FK - table_id (lihat kontrak #4)
+     "created_by": "kasir01",
+     "branch": 1
+   }
+
+b) module=billing, function=payment_customer_point_history
+   URL: POST /Billing/payment_customer_point_history
+   Dipicu saat: payment mode Reguler dengan member terisi (poin
+   dihitung dari table_point x durasi aktual)
+   Body: sama seperti (a), tapi "ref_type": "Transaction",
+   "ref_id" = transaction_id
+
+   Catatan: field lengkap movement (point, point_before, point_after,
+   description) TIDAK dikirim ke gameon di payload notify ini - hanya
+   konteks minimal (customer_id, ref_type, ref_id, created_by, branch).
+   Kalau gameon perlu detail poin lengkap, ambil dari endpoint
+   /master/customer_point_history (baca) di billing_api, atau minta
+   penyesuaian payload lebih lanjut.
+
+------------------------------------------------------------------
+2. customer_time  [INSERT & EDIT]
+------------------------------------------------------------------
+a) module=master ATAU billing, function=save_customer_time
+   action=insert, table=customer_time
+   URL: POST /Master/save_customer_time  atau  POST /Billing/save_customer_time
+   Body (dari endpoint Master::save_customer_time, body asli client
+   diteruskan apa adanya):
+   {
+     "customer_id": 6,
+     "category_meja_id": 2,
+     "time_remaining": "01:30:00",
+     "transaction_ref": "INV/001",
+     "created_by": "kasir01"
+   }
+   (dari internal payment() dengan save_time=Y, body dirakit manual
+   dengan field yang sama)
+
+b) function=use_customer_time
+   action=edit, table=customer_time
+   URL: POST /Master/use_customer_time  atau  POST /Billing/use_customer_time
+   Body: sama strukturnya, field "time_used" bukan "time_remaining"
+
+   Catatan: customer_time TIDAK termasuk 6 table "CABANG" (tidak ada
+   field "branch" di payload table ini secara langsung) - cabang
+   dicatat di customer_time_history (child table-nya, lihat #3). Tidak
+   ada satupun ID row customer_time yang dikirim - gameon cari/buat
+   row customer_time sendiri berdasarkan (customer_id, category_meja_id).
+
+------------------------------------------------------------------
+3. customer_time_history  [INSERT only - CABANG]
+------------------------------------------------------------------
+Selalu dikirim BERPASANGAN setelah notify customer_time di atas
+(1 notify customer_time + 1 notify customer_time_history per aksi).
+action=insert, table=customer_time_history
+
+a) function=save_customer_time_history (movement type IN)
+   URL: POST /Master/save_customer_time_history atau /Billing/save_customer_time_history
+   Body:
+   {
+     "customer_id": 6,
+     "category_meja_id": 2,
+     "time_remaining": "01:30:00",
+     "time_movement_type": "IN",
+     "transaction_ref": "INV/001",      // null kalau tidak ada
+     "created_by": "kasir01",
+     "branch": 1
+   }
+
+b) function=use_customer_time_history (movement type OUT)
+   URL: POST /Master/use_customer_time_history atau /Billing/use_customer_time_history
+   Body: sama strukturnya, "time_movement_type": "OUT",
+   "time_remaining" berisi durasi yang DIPAKAI (bukan sisa)
+
+------------------------------------------------------------------
+4. history_saldo  [INSERT only - CABANG]
+------------------------------------------------------------------
+action=insert, table=history_saldo.
+Dikirim dari 3 titik (semua saat saldo customer berubah):
+
+a) module=master, function=add_customer_saldo_history (type IN, top up)
+   URL: POST /Master/add_customer_saldo_history
+   Body:
+   {
+     "transaksi_saldo_id": 6,        // FK - lihat kontrak #4
+     "customer_id": 6,
+     "history_saldo_type": "IN",
+     "created_by": "kasir01",
+     "branch": 1
+   }
+
+b) module=billing, function=payment_history_saldo (type OUT, potong saldo saat payment billing)
+   URL: POST /Billing/payment_history_saldo
+   Body:
+   {
+     "customer_id": 6,
+     "history_saldo_type": "OUT",
+     "amount": 25000,
+     "ref_type": "Transaction",
+     "ref_id": 18,                  // FK - transaction_id, lihat kontrak #4
+     "created_by": "kasir01",
+     "branch": 1
+   }
+
+c) module=cafe, function=save_transaction_cafe_history_saldo (type OUT, potong saldo saat transaksi cafe)
+   URL: POST /Cafe/save_transaction_cafe_history_saldo
+   Body:
+   {
+     "customer_id": 6,
+     "history_saldo_type": "OUT",
+     "ref_type": "TransactionCafe",
+     "ref_id": 3,                   // FK - transaction_cafe_id, lihat kontrak #4
+     "created_by": "kasir01",
+     "branch": 1
+   }
+
+   Catatan: amount/saldo_before/saldo_after TIDAK selalu ikut di semua
+   payload (lihat (b) yang membawa amount, (a)/(c) tidak) - kalau
+   gameon butuh nominal lengkap untuk (a)/(c), minta penyesuaian atau
+   hitung dari data transaksi terkait (transaksi_saldo/transaction_cafe).
+
+------------------------------------------------------------------
+5. ms_customer  [INSERT, EDIT, DELETE]
+------------------------------------------------------------------
+module=master, table=ms_customer
+TIDAK termasuk table "CABANG" (tidak ada field branch).
+
+a) function=add_customer, action=insert
+   URL: POST /Master/add_customer
+   Body (raw dari client, TIDAK ada customer_id - row belum ada ID
+   sampai di-insert; gameon generate ID sendiri):
+   {
+     "customer_name": "Adrian",
+     "customer_phone": "0812xxxx",
+     "customer_pass": "12345",       // plaintext, DIKIRIM APA ADANYA
+     "customer_address": "Jl. Juang",
+     "customer_email": "a@b.com"
+   }
+   PENTING: customer_pass DIKIRIM PLAINTEXT (sebelumnya di-strip demi
+   keamanan, sekarang SENGAJA dikirim atas permintaan eksplisit -
+   gameon harus terima & simpan sendiri, misal di-hash ulang di sisi
+   gameon).
+
+b) function=edit_customer, action=edit
+   URL: POST /Master/edit_customer
+   Body: { "customer_id": 6, ...field yang diubah saja...,
+           "customer_pass": "<md5-hash>" }
+   customer_id di sini ID YANG SUDAH ADA (dikirim client untuk
+   menunjuk row mana yang diedit) - lihat kontrak #4 soal mapping ID
+   billing_api <-> ID gameon kalau tidak identik.
+
+c) function=delete_customer, action=delete
+   URL: POST /Master/delete_customer
+   Body: { "customer_id": 6 }
+
+d) function=reset_pass_customer, action=edit
+   URL: POST /Master/reset_pass_customer
+   Body: { "customer_id": 6 }
+   (password di-reset ke default di billing_api; body notify HANYA
+   berisi customer_id, TIDAK membawa password baru)
+
+------------------------------------------------------------------
+6. ms_payment  [TIDAK ADA CRUD]
+------------------------------------------------------------------
+Tidak ada endpoint tambah/ubah/hapus ms_payment di billing_api saat
+ini (hanya GET /master/get_payment_list untuk baca). Tidak akan
+pernah ada notify untuk table ini kecuali endpoint CRUD-nya dibuat
+nanti.
+
+------------------------------------------------------------------
+7. ms_point_exchange  [INSERT, EDIT, DELETE]
+------------------------------------------------------------------
+module=setting, table=ms_point_exchange
+
+a) function=add_point_exchange, action=insert
+   URL: POST /Setting/add_point_exchange
+   Endpoint asli multipart/form-data (upload gambar), body notify
+   dirakit manual TANPA file gambar dan TANPA id (row belum punya id):
+   {
+     "ms_point_exchange_name": "Free Drink",
+     "ms_point_exchange_point": 100,
+     "ms_point_exchange_desc": "Tukar minuman gratis"
+   }
+
+b) function=edit_point_exchange, action=edit
+   URL: POST /Setting/edit_point_exchange
+   Body: { "ms_point_exchange_id": 3, ...field yang diubah saja...}
+   (ms_point_exchange_id di sini ID yang sudah ada, dipakai untuk
+   menunjuk row yang diedit; ms_point_exchange_image dikecualikan)
+
+c) function=delete_point_exchange, action=delete
+   URL: POST /Setting/delete_point_exchange
+   Body: { "ms_point_exchange_id": 3 }
+
+------------------------------------------------------------------
+8. ms_product  [INSERT, EDIT, DELETE]
+------------------------------------------------------------------
+module=master, table=ms_product
+
+a) function=add_product, action=insert
+   URL: POST /Master/add_product
+   Endpoint asli multipart/form-data, body notify dirakit manual
+   TANPA file gambar dan TANPA id:
+   {
+     "category_id": 1,
+     "unit_id": 1,
+     "product_name": "Kopi Susu",
+     "product_price": 15000,
+     "product_cogs": 8000,
+     "product_stock": 50,
+     "reduce_stock": "Y"
+   }
+
+b) function=edit_product, action=edit
+   URL: POST /Master/edit_product
+   Body: { "product_id": 12, ...field yg diubah saja... }
+   (product_image dikecualikan)
+
+c) function=delete_product, action=delete
+   URL: POST /Master/delete_product
+   Body: { "product_id": 12 }
+
+------------------------------------------------------------------
+9. ms_promo  [INSERT, EDIT, DELETE]
+------------------------------------------------------------------
+module=master, table=ms_promo
+
+a) function=add_promo, action=insert
+   URL: POST /Master/add_promo
+   Body: { "ms_promo_name": "Diskon Weekday", "ms_promo_tipe": "Diskon",
+           "ms_promo_value": 10 }
+   (ms_promo_tipe: "Diskon" (persen) atau "Fix" (nominal))
+
+b) function=edit_promo, action=edit
+   URL: POST /Master/edit_promo
+   Body: { "ms_promo_id": 5, ...field yg diubah saja... }
+
+c) function=delete_promo, action=delete
+   URL: POST /Master/delete_promo
+   Body: { "ms_promo_id": 5 }
+
+------------------------------------------------------------------
+10. ms_saldo  [INSERT, EDIT, DELETE]
+------------------------------------------------------------------
+module=setting, table=ms_saldo
+
+a) function=add_saldo, action=insert
+   URL: POST /Setting/add_saldo
+   Body: { "ms_saldo_nominal": 50000, "ms_saldo_price": 48000,
+           "ms_saldo_discount": 2000 }
+
+b) function=edit_saldo, action=edit
+   URL: POST /Setting/edit_saldo
+   Body: { "ms_saldo_id": 1, ...field yg diubah saja... }
+
+c) function=delete_saldo, action=delete
+   URL: POST /Setting/delete_saldo
+   Body: { "ms_saldo_id": 1 }
+
+------------------------------------------------------------------
+11. transaction  [INSERT, DELETE - CABANG]
+------------------------------------------------------------------
+module=billing, table=transaction
+
+a) function=payment, action=insert
+   URL: POST /Billing/payment
+   Body (raw dari client + branch ditambahkan, TANPA id):
+   {
+     "transaction_mode": "Reguler",
+     "transaction_customer_id": 6,
+     "transaction_payment_id": 1,
+     "transaction_promo_id": 0,
+     "transaction_start_time": "2026-08-14 11:00:00",
+     "transaction_end_time": null,
+     "transaction_duration": null,
+     "transaction_sub_total": 10000,
+     "transaction_tax": 0,
+     "transaction_total_bill": 10000,
+     "transaction_table": 1,
+     "created_by": "kasir01",
+     "paid_by": 65,
+     "save_time": "N",
+     "used_save_time": "N",
+     "branch": 2
+   }
+
+b) function=cancel_table, action=delete
+   URL: POST /Billing/cancel_table
+   Body: { "table_id": 2, "created_by": "kasir01", "paid_by": 65,
+           "branch": 2 }
+   (action "delete" di sini berarti "meja dibatalkan sebelum
+   payment", BUKAN transaction row-nya dihapus - row transaction tetap
+   dibuat di billing_api sebagai catatan pembatalan. table_id di sini
+   adalah ID meja yang dibatalkan, BUKAN id transaction yang dibuat)
+
+------------------------------------------------------------------
+12. transaction_cafe  [INSERT only - CABANG]
+------------------------------------------------------------------
+module=cafe, function=save_transaction_cafe, action=insert
+table=transaction_cafe
+URL: POST /Cafe/save_transaction_cafe
+Body (raw dari client + branch ditambahkan, TANPA id):
+{
+  "customer_id": 6,
+  "promo_id": 0,
+  "payment_id": 2,
+  "table": 0,
+  "tax": 0,
+  "created_by": "kasir01",
+  "paid_by": 65,
+  "items": [ { "product_id": 3, "qty": 2 } ],
+  "branch": 2
+}
+(items yang dikirim adalah RAW request dari client, bukan hasil
+kalkulasi/harga final - harga/sub_total/total_bill final ada di
+row transaction_cafe di billing_api, tidak dikirim ulang di payload
+notify ini)
+
+------------------------------------------------------------------
+13. transaction_cafe_detail  [INSERT only]
+------------------------------------------------------------------
+module=cafe, function=save_transaction_cafe_detail, action=insert
+table=transaction_cafe_detail
+URL: POST /Cafe/save_transaction_cafe_detail
+Dikirim 1x PER ITEM (looping semua item di transaksi cafe tsb),
+segera setelah notify transaction_cafe (#12):
+{
+  "transaction_cafe_id": 3,     // FK - lihat kontrak #4
+  "product_id": 3,
+  "qty": 2
+}
+(TIDAK termasuk table CABANG - branch ada di transaction_cafe
+induknya. gameon perlu cara sendiri menghubungkan detail ini ke row
+transaction_cafe miliknya, karena transaction_cafe_id di sini adalah
+ID milik billing_api - lihat kontrak #4)
+
+------------------------------------------------------------------
+14. transaksi_saldo  [INSERT only - CABANG]
+------------------------------------------------------------------
+module=master, function=add_customer_saldo, action=insert
+table=transaksi_saldo
+URL: POST /Master/add_customer_saldo
+Body (raw dari client + branch ditambahkan, TANPA id):
+{
+  "customer_id": 6,
+  "ms_saldo_id": 1,
+  "payment_id": 1,
+  "created_by": "kasir01",
+  "paid_by": 65,
+  "branch": 2
+}
+(selalu diikuti 1 notify tambahan ke history_saldo, lihat table #4a -
+history_saldo tsb membawa "transaksi_saldo_id" sebagai FK, gameon
+perlu cara sendiri menghubungkannya - lihat kontrak #4)
+
+------------------------------------------------------------------
+15. unit  [INSERT, EDIT, DELETE]
+------------------------------------------------------------------
+module=master, table=unit
+
+a) function=add_unit, action=insert
+   URL: POST /Master/add_unit
+   Body: { "unit_name": "Pcs" }
+
+b) function=edit_unit, action=edit
+   URL: POST /Master/edit_unit
+   Body: { "unit_id": 4, "unit_name": "Pieces" }
+
+c) function=delete_unit, action=delete
+   URL: POST /Master/delete_unit
+   Body: { "unit_id": 4 }
+
+
+==================================================================
+REKOMENDASI STRUKTUR gameon (RINGKAS)
+==================================================================
+1. Buat controller per module (Master, Billing, Cafe, Setting) dengan
+   function persis sama nama dengan yang tercantum di dokumen ini,
+   supaya URL routing otomatis dari billing_api langsung nyambung.
+2. Setiap function terima JSON body dari php://input, baca field
+   langsung dari root (bukan dari "data").
+3. Semua primary key di gameon di-generate SENDIRI (AUTO_INCREMENT
+   normal) - JANGAN mengandalkan ID dari billing_api sebagai PK gameon
+   (lihat kontrak #4). Kalau butuh mengaitkan child row ke parent
+   (mis. transaction_cafe_detail ke transaction_cafe), simpan ID
+   billing_api sebagai kolom referensi terpisah (mis. "source_ref_id"),
+   lalu JOIN lewat kolom itu - bukan lewat primary key gameon sendiri.
+4. Selalu balas { "code": 200, "result": "..." } dengan HTTP 200 kalau
+   berhasil diproses, supaya billing_api mencatatnya sebagai sukses
+   (kolom {table}_upload_status di billing_api akan ikut ter-update).
+5. Endpoint boleh dibangun bertahap - selama belum ada, billing_api
+   akan terus gagal-kirim dengan aman (tercatat di
+   history_hit_api_logs, tidak mengganggu operasional billing_api).

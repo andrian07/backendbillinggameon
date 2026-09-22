@@ -1,0 +1,26 @@
+   step instalasi sifsoft
+
+1. jalankan file setup.bat pada folder,  tunggu selesai (bila windows 7 maka jalankan sebagai administrator)
+   jika muncul pilihan maka pilih YES atau NEXT
+2. Jalankan file DSN.exe tentukan databasenya (c:\basic.mdb) lalu klik aktifkan
+2. Jalankan file Sifsoft.exe
+   bila muncul aktifasi database maka pilih file databasenya di folder tersebut lalu pilih aktifkan
+ 
+   bila ada masalah maka lakukan dengan manual
+   a. Copy File basic.mdb letakkan di folder lain (contoh C:\Data\basic.mdb) 
+   seting databasenya pada "USER DSN" di COntrol Panel
+		==>Administrative tools==>Datasource(ODBC)==>Add ==>> dengan Namanya "DBBilling" 
+		dan pilih file == basic.mdb == nya
+
+	    =======>>> untuk ganti dengan data base basic.mdb maka ubah (diseting ODBC-nya) pilih     "DbBilling" lalu klik "configure" lalu "select " lalu pilih "namafile.mdb"-nya
+
+3.set regional pada control panel harus indonesia 
+
+ 
+Setelah tampil  maka aktifkan menu kasir >>>>> personal1 >>> isikan passwordnya : 123
+
+bila tampilan program tidak penuh atau terpotong maka seting display monitornya :
+>>> pilih control panel >>>> Display >>>> setting >>>> gerakkan screen resolusion
+menjadi 1024 pixels
+
+* jika OS Windows 98 maka jalankan file vbrun60.exe yang ada di folder, tunggu selesai
