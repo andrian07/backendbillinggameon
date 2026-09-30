@@ -83,8 +83,8 @@ class Report extends CI_Controller {
 			echo json_encode(['code' => 0, 'result' => 'user_id, keterangan, dan nominal (> 0) wajib diisi']);
 			return;
 		}
-		if (!in_array($channel, ['billing', 'cafe'], true)) {
-			echo json_encode(['code' => 0, 'result' => 'channel harus billing atau cafe']);
+		if (!in_array($channel, ['billing', 'mahjong', 'cafe'], true)) {
+			echo json_encode(['code' => 0, 'result' => 'channel harus billing, mahjong, atau cafe']);
 			return;
 		}
 
@@ -422,6 +422,8 @@ class Report extends CI_Controller {
 			'date_to' => $date_to,
 			'customer_id' => !empty($body['customer_id']) ? (int) $body['customer_id'] : 0,
 			'paid_by' => !empty($body['paid_by']) ? (int) $body['paid_by'] : 0,
+			// billiard/mahjong - hanya dipakai get_billing_report(), laporan lain abaikan key ini
+			'category_type' => !empty($body['category_type']) ? $body['category_type'] : '',
 		);
 	}
 

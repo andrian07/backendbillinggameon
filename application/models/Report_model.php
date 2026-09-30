@@ -57,15 +57,20 @@ class Report_model extends CI_Model {
 
     // billing & cafe dalam rentang tanggal tertentu, masing-masing dipecah per jenis pembayaran (payment_id)
     private function get_payment_breakdown($user_id, $range) {
-        $this->db->select('t.transaction_payment_id AS payment_id, p.payment_name, SUM(t.transaction_total_bill) AS total_amount, COUNT(t.transaction_id) AS total_nota', false);
-        $this->db->from('transaction t');
-        $this->db->join('ms_payment p', 'p.payment_id = t.transaction_payment_id', 'left');
-        $this->db->where('t.paid_by', $user_id);
-        $this->db->where('t.transaction_status', 'Done');
-        $this->db->where('t.created_at >=', $range['start']);
-        $this->db->where('t.created_at <=', $range['end']);
-        $this->db->group_by('t.transaction_payment_id');
-        $billing_rows = $this->db->get()->result();
+        // transaksi meja dipisah per jenis (billiard / mahjong) lewat transaction_category_type
+        $table_rows = array();
+        foreach (array('billiard', 'mahjong') as $category_type) {
+            $this->db->select('t.transaction_payment_id AS payment_id, p.payment_name, SUM(t.transaction_total_bill) AS total_amount, COUNT(t.transaction_id) AS total_nota', false);
+            $this->db->from('transaction t');
+            $this->db->join('ms_payment p', 'p.payment_id = t.transaction_payment_id', 'left');
+            $this->db->where('t.paid_by', $user_id);
+            $this->db->where('t.transaction_status', 'Done');
+            $this->db->where('t.transaction_category_type', $category_type);
+            $this->db->where('t.created_at >=', $range['start']);
+            $this->db->where('t.created_at <=', $range['end']);
+            $this->db->group_by('t.transaction_payment_id');
+            $table_rows[$category_type] = $this->db->get()->result();
+        }
 
         $this->db->select('c.transaction_cafe_payment_id AS payment_id, p.payment_name, SUM(c.transaction_cafe_total_bill) AS total_amount, COUNT(c.transaction_cafe_id) AS total_nota', false);
         $this->db->from('transaction_cafe c');
@@ -88,7 +93,8 @@ class Report_model extends CI_Model {
         $saldo_rows = $this->db->get()->result();
 
         return array(
-            'billing' => $this->map_payment_rows($billing_rows),
+            'billing' => $this->map_payment_rows($table_rows['billiard']),
+            'mahjong' => $this->map_payment_rows($table_rows['mahjong']),
             'cafe' => $this->map_payment_rows($cafe_rows),
             'saldo' => $this->map_payment_rows($saldo_rows),
         );
@@ -103,6 +109,7 @@ class Report_model extends CI_Model {
             'business_date' => $range['business_date'],
             'user_id' => (int) $user_id,
             'billing' => $breakdown['billing'],
+            'mahjong' => $breakdown['mahjong'],
             'cafe' => $breakdown['cafe'],
             'saldo' => $breakdown['saldo'],
         );
@@ -117,6 +124,7 @@ class Report_model extends CI_Model {
             'business_date' => $range['business_date'],
             'user_id' => (int) $user_id,
             'billing' => $breakdown['billing'],
+            'mahjong' => $breakdown['mahjong'],
             'cafe' => $breakdown['cafe'],
             'saldo' => $breakdown['saldo'],
             'cafe_items' => $this->get_cafe_items_sold($user_id, $range),
@@ -125,6 +133,7 @@ class Report_model extends CI_Model {
             'expenses' => $expenses['data'],
             'expense_total' => $expenses['total'],
             'expense_total_billing' => $expenses['total_billing'],
+            'expense_total_mahjong' => $expenses['total_mahjong'],
             'expense_total_cafe' => $expenses['total_cafe'],
         );
     }
@@ -136,7 +145,7 @@ class Report_model extends CI_Model {
     // $channel: 'billing' | 'cafe' (default 'billing' kalau tidak valid).
     public function add_cash_expense($user_id, $keterangan, $nominal, $channel = 'billing', $date = null) {
         $business_date = !empty($date) ? $date : date('Y-m-d');
-        $channel = ($channel === 'cafe') ? 'cafe' : 'billing';
+        $channel = in_array($channel, array('cafe', 'mahjong'), true) ? $channel : 'billing';
         $user = $this->db->where('user_id', (int) $user_id)->get('ms_user')->row();
 
         $this->db->insert('cash_expense', array(
@@ -163,10 +172,11 @@ class Report_model extends CI_Model {
         $data = array();
         $total = 0;
         $total_billing = 0;
+        $total_mahjong = 0;
         $total_cafe = 0;
         foreach ($rows as $r) {
             $nominal = (int) $r->nominal;
-            $channel = ($r->channel === 'cafe') ? 'cafe' : 'billing';
+            $channel = in_array($r->channel, array('cafe', 'mahjong'), true) ? $r->channel : 'billing';
             $data[] = array(
                 'id'         => (int) $r->cash_expense_id,
                 'keterangan' => $r->keterangan,
@@ -176,12 +186,14 @@ class Report_model extends CI_Model {
             );
             $total += $nominal;
             if ($channel === 'cafe') $total_cafe += $nominal;
+            elseif ($channel === 'mahjong') $total_mahjong += $nominal;
             else $total_billing += $nominal;
         }
         return array(
             'data' => $data,
             'total' => $total,
             'total_billing' => $total_billing,
+            'total_mahjong' => $total_mahjong,
             'total_cafe' => $total_cafe,
         );
     }
@@ -224,7 +236,7 @@ class Report_model extends CI_Model {
     public function get_billing_report($filter) {
         $range = $this->get_business_range($filter['date_from'], $filter['date_to']);
 
-        $this->db->select('t.transaction_id, t.transaction_inv, t.transaction_date, t.transaction_start_time, t.transaction_end_time, t.transaction_sub_total, t.transaction_discount, t.transaction_tax, t.transaction_total_bill, t.transaction_saved_time_value, t.transaction_type, t.transaction_status, p.ms_promo_name, p.ms_promo_tipe, p.ms_promo_value, c.customer_name, u.username, pay.payment_name', false);
+        $this->db->select('t.transaction_id, t.transaction_inv, t.transaction_date, t.transaction_start_time, t.transaction_end_time, t.transaction_sub_total, t.transaction_discount, t.transaction_tax, t.transaction_total_bill, t.transaction_saved_time_value, t.transaction_type, t.transaction_status, t.transaction_category_type, p.ms_promo_name, p.ms_promo_tipe, p.ms_promo_value, c.customer_name, u.username, pay.payment_name', false);
         $this->db->from('transaction t');
         $this->db->join('ms_customer c', 'c.customer_id = t.transaction_customer_id', 'left');
         $this->db->join('ms_user u', 'u.user_id = t.paid_by', 'left');
@@ -234,6 +246,8 @@ class Report_model extends CI_Model {
         $this->db->where('t.created_at <=', $range['end']);
         if (!empty($filter['customer_id'])) $this->db->where('t.transaction_customer_id', $filter['customer_id']);
         if (!empty($filter['paid_by'])) $this->db->where('t.paid_by', $filter['paid_by']);
+        // billiard/mahjong - snapshot disimpan per transaksi saat payment() (lihat add_transaction)
+        if (!empty($filter['category_type'])) $this->db->where('t.transaction_category_type', $filter['category_type']);
         $this->db->order_by('t.created_at', 'ASC');
         $query = $this->db->get();
 
@@ -263,6 +277,7 @@ class Report_model extends CI_Model {
                 'used_saved_time' => $row->transaction_saved_time_value !== null || $row->transaction_type === 'Gunakan Timer',
                 'saved_time_value' => $row->transaction_saved_time_value !== null ? (int) $row->transaction_saved_time_value : null,
                 'status' => $row->transaction_status,
+                'category_type' => $row->transaction_category_type,
             );
             $summary['jumlah_nota']++;
             $summary['total_sub_total'] += (int) $row->transaction_sub_total;

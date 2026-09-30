@@ -28,7 +28,16 @@ class Billing extends CI_Controller {
 
     public function get_table_list()
     {
-        $data = $this->billing_model->get_table_list();
+        $body = $this->_post_body();
+        if ($body === null) return;
+
+        // table_type opsional: 'billiard'/'mahjong' buat filter langsung di query (dipakai
+        // halaman Billing & Mahjong yang masing-masing cuma butuh separuh daftar meja),
+        // dikosongkan/nilai lain = semua meja (dipakai Sync & tempat lain yang butuh semuanya)
+        $table_type = isset($body['table_type']) ? $body['table_type'] : null;
+        if (!in_array($table_type, array('billiard', 'mahjong'), true)) $table_type = null;
+
+        $data = $this->billing_model->get_table_list($table_type);
         echo json_encode($data);
     }
 
@@ -77,8 +86,20 @@ class Billing extends CI_Controller {
             return;
         }
 
+        // pemain mahjong (maks 4, harus member terdaftar) - id dikirim client, nama di-resolve
+        // & divalidasi (dedup + tidak sedang aktif di meja lain) di sini, lihat
+        // Billing_model::resolve_players()
+        $player_ids_raw = isset($body['table_player_ids']) ? trim($body['table_player_ids']) : '';
+        $players_result = $this->billing_model->resolve_players($player_ids_raw, $table_id);
+        if (is_string($players_result)) {
+            echo json_encode(['code' => 0, 'result' => $players_result]);
+            return;
+        }
+
         $data = array(
             'table_customer_id' => $customer_id,
+            'table_players' => $players_result['names'],
+            'table_player_ids' => $players_result['ids'],
             'table_promo_id' => $promo_id,
             'table_mode' => $mode,
             'table_start_time' => $start_time,
@@ -151,6 +172,16 @@ class Billing extends CI_Controller {
                 $schedule_error = $this->billing_model->validate_promo_schedule($promo, $start_time, $data['table_end_time'], $mode);
                 if ($schedule_error !== null) {
                     echo json_encode(['code' => 0, 'result' => $schedule_error]);
+                    return;
+                }
+                // promo tipe Fix = paket harga+durasi tetap (lihat Billing_model::is_fix_promo() &
+                // calculate_price()) - hanya masuk akal untuk mode Timer (ada table_end_time yang
+                // pasti). Mode Reguler tidak punya durasi tetap, jadi tidak boleh dipasangkan dengan
+                // promo Fix (dulu lolos tanpa dicek sama sekali kalau promo Fix-nya tidak punya
+                // jendela jam - lihat validate_promo_schedule() di atas yang hanya menolak promo
+                // berjendela jam).
+                if ($promo->ms_promo_tipe === 'Fix' && $mode !== 'Timer') {
+                    echo json_encode(['code' => 0, 'result' => 'Promo Hanya Untuk Timer saja']);
                     return;
                 }
             }
@@ -283,8 +314,8 @@ class Billing extends CI_Controller {
                 return;
             }
 
-            $price_tier = $this->billing_model->get_category_meja_price_tier($table_row->table_category);
-            $price = $this->billing_model->calculate_price($start_time, $data['table_end_time'], $promo_id, $price_tier, 'Timer');
+            $tier_info = $this->billing_model->get_category_meja_price_tier($table_row->table_category);
+            $price = $this->billing_model->calculate_price($start_time, $data['table_end_time'], $promo_id, $tier_info['tier'], 'Timer', $tier_info['type']);
             if (!empty($price['promo_rejected_reason'])) {
                 echo json_encode(['code' => 0, 'result' => $price['promo_rejected_reason']]);
                 return;
@@ -641,6 +672,39 @@ class Billing extends CI_Controller {
             echo json_encode(['code' => 200, 'result' => 'Metode pembayaran berhasil diubah']);
         } else {
             echo json_encode(['code' => 0, 'result' => 'Gagal mengubah metode pembayaran']);
+        }
+    }
+
+    // batalkan transaksi billing yang SUDAH "Done" (bukan cancel_table() di bawah, yang untuk meja
+    // yang masih aktif) - ditolak untuk "Potong Saldo"/"Gunakan Timer" (lihat komentar lengkap di
+    // Billing_model::cancel_transaction())
+    public function cancel_transaction()
+    {
+        $body = $this->_post_body();
+        if ($body === null) return;
+
+        $transaction_id = isset($body['transaction_id']) ? (int) $body['transaction_id'] : 0;
+        $created_by = isset($body['created_by']) ? trim($body['created_by']) : '';
+        if ($transaction_id <= 0 || $created_by === '') {
+            echo json_encode(['code' => 0, 'result' => 'transaction_id dan created_by wajib diisi']);
+            return;
+        }
+
+        $result = $this->billing_model->cancel_transaction($transaction_id, $created_by);
+
+        if ($result === 'NOT_FOUND') {
+            echo json_encode(['code' => 0, 'result' => 'Transaksi tidak ditemukan']);
+        } else if ($result === 'ALREADY_CANCELLED') {
+            echo json_encode(['code' => 0, 'result' => 'Transaksi sudah dibatalkan sebelumnya']);
+        } else if ($result === 'SALDO_NOT_ALLOWED') {
+            echo json_encode(['code' => 0, 'result' => 'Transaksi dengan metode Potong Saldo tidak bisa dibatalkan lewat sini - saldo yang sudah terpotong tidak bisa dikembalikan otomatis']);
+        } else if ($result === 'SAVED_TIME_NOT_ALLOWED') {
+            echo json_encode(['code' => 0, 'result' => 'Transaksi yang dibayar pakai waktu tersimpan tidak bisa dibatalkan lewat sini - waktu yang sudah terpotong tidak bisa dikembalikan otomatis']);
+        } else if ($result) {
+            $this->_sync_transaction_to_gameon($transaction_id);
+            echo json_encode(['code' => 200, 'result' => 'Transaksi berhasil dibatalkan']);
+        } else {
+            echo json_encode(['code' => 0, 'result' => 'Gagal membatalkan transaksi']);
         }
     }
 
@@ -1024,6 +1088,12 @@ class Billing extends CI_Controller {
         // billing_end_time = table_end_time penuh, jadi customer langsung dapat poin sesuai jam yang
         // dibayar penuh (mis. bayar 25 jam -> poin 25 jam). used_save_time = Y tetap 0 poin (guard di bawah).
         $billed_duration = $duration;
+        // jenis kategori meja (billiard/mahjong) snapshot buat transaction_category_type - default
+        // billiard kalau blok di bawah ini ter-skip (table_row kosong/belum pernah start_time).
+        $category_type = 'billiard';
+        // nominal diskon promo (buat transaction_discount & nota) - default 0 kalau blok di bawah
+        // ter-skip atau tidak pakai promo sama sekali.
+        $total_promo = 0;
         if ($table_row && !empty($table_row->table_start_time)) {
             $effective_mode = !empty($table_row->table_mode) ? $table_row->table_mode : $mode;
 
@@ -1045,9 +1115,20 @@ class Billing extends CI_Controller {
                 echo json_encode(['code' => 0, 'result' => 'Promo ini tidak berlaku untuk kategori meja ini']);
                 return;
             }
+            // promo tipe Fix hanya untuk mode Timer (sama seperti guard di book_table) - jaring
+            // pengaman kalau ada table_active lama yang lolos sebelum guard itu ada, atau promo
+            // diganti saat bayar
+            if (!empty($promo_id)) {
+                $promo_check = $this->billing_model->get_promo_detail($promo_id);
+                if ($promo_check && $promo_check->ms_promo_tipe === 'Fix' && $effective_mode !== 'Timer') {
+                    echo json_encode(['code' => 0, 'result' => 'Promo Hanya Untuk Timer saja']);
+                    return;
+                }
+            }
 
-            $price_tier = $this->billing_model->get_category_meja_price_tier($table_row->table_category);
-            $price = $this->billing_model->calculate_price($table_row->table_start_time, $billing_end_time, $promo_id, $price_tier, $effective_mode);
+            $tier_info = $this->billing_model->get_category_meja_price_tier($table_row->table_category);
+            $category_type = $tier_info['type'];
+            $price = $this->billing_model->calculate_price($table_row->table_start_time, $billing_end_time, $promo_id, $tier_info['tier'], $effective_mode, $category_type);
             if (!empty($price['promo_rejected_reason'])) {
                 echo json_encode(['code' => 0, 'result' => $price['promo_rejected_reason']]);
                 return;
@@ -1055,6 +1136,7 @@ class Billing extends CI_Controller {
             $sub_total = $price['total_billing'];
             $tax = $price['total_tax'];
             $total_bill = $price['total_transaksi'];
+            $total_promo = $price['total_promo'];
 
             $billed_seconds = max(0, strtotime($billing_end_time) - strtotime($table_row->table_start_time));
             $billed_duration = $this->_seconds_to_time($billed_seconds);
@@ -1318,9 +1400,13 @@ class Billing extends CI_Controller {
             'end_time' => $end_time,
             'duration' => $duration,
             'sub_total' => $sub_total,
+            'total_promo' => $total_promo,
             'tax' => $tax,
             'total_bill' => $total_bill,
             'table' => $table,
+            'category_type' => $category_type,
+            'players' => $table_row ? $table_row->table_players : null,
+            'player_ids' => $table_row ? $table_row->table_player_ids : null,
             'payment_type' => $used_save_time === 'Y' ? 'Gunakan Timer' : 'Normal',
             'saved_time_value' => isset($saved_time_value) ? $saved_time_value : null,
             'created_by' => $created_by,
@@ -1627,7 +1713,7 @@ class Billing extends CI_Controller {
         }
         $end_time = date('Y-m-d H:i:s', $end_ts);
         $promo_id = (int) $table->table_promo_id;
-        $price_tier = $this->billing_model->get_category_meja_price_tier($table->table_category);
+        $tier_info = $this->billing_model->get_category_meja_price_tier($table->table_category);
 
         if (strtoupper((string) $table->use_saved_time) === 'Y') {
             // meja ini sudah "dibayar di muka" pakai sisa waktu tersimpan customer saat buka meja
@@ -1643,7 +1729,7 @@ class Billing extends CI_Controller {
                 'prepaid_with_saved_time' => true,
             );
         } else {
-            $data = $this->billing_model->calculate_price($start_time, $end_time, $promo_id, $price_tier, $table->table_mode);
+            $data = $this->billing_model->calculate_price($start_time, $end_time, $promo_id, $tier_info['tier'], $table->table_mode, $tier_info['type']);
             $data['prepaid_with_saved_time'] = false;
         }
         $data['table_id'] = (int) $table->table_id;
@@ -1700,7 +1786,18 @@ class Billing extends CI_Controller {
         $dir = FCPATH . 'reader/';
         if (!is_dir($dir)) mkdir($dir, 0755, true);
 
-        file_put_contents($dir . $relay_number . $status . '.txt', '');
+        $file = $dir . $relay_number . $status . '.txt';
+
+        // file lama bisa saja dibuat oleh user OS lain (mis. sebelum server dipindah/di-clone) dan
+        // jadi tidak writable oleh user yang menjalankan PHP sekarang - file_put_contents() ke file
+        // begitu gagal dengan Warning "Permission denied" walau direktorinya sendiri writable.
+        // Hapus dulu (izin hapus ditentukan oleh direktori, bukan pemilik file) baru tulis ulang -
+        // filenya jadi otomatis dimiliki user yang sedang jalan.
+        if (file_exists($file)) {
+            @unlink($file);
+        }
+
+        file_put_contents($file, '');
     }
 
 }

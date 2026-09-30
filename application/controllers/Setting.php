@@ -415,12 +415,17 @@ class Setting extends CI_Controller {
 			echo json_encode(['code' => 0, 'result' => 'category_meja_price harus 1, 2, 3, 4, atau 5']);
 			return;
 		}
+		$type = isset($body['category_meja_type']) ? $body['category_meja_type'] : 'billiard';
+		if (!in_array($type, array('billiard', 'mahjong'))) {
+			echo json_encode(['code' => 0, 'result' => 'category_meja_type harus billiard atau mahjong']);
+			return;
+		}
 		if ($this->setting_model->is_category_meja_name_exists($name)) {
 			echo json_encode(['code' => 0, 'result' => 'Nama kategori meja sudah digunakan']);
 			return;
 		}
 
-		$category_meja_id = $this->setting_model->add_category_meja($name, $price);
+		$category_meja_id = $this->setting_model->add_category_meja($name, $price, $type);
 		if ($category_meja_id) {
 			echo json_encode(['code' => 200, 'result' => 'Kategori meja berhasil ditambahkan', 'category_meja_id' => $category_meja_id]);
 		} else {
@@ -451,9 +456,16 @@ class Setting extends CI_Controller {
 			return;
 		}
 
+		$type = isset($body['category_meja_type']) ? $body['category_meja_type'] : null;
+		if ($type !== null && !in_array($type, array('billiard', 'mahjong'))) {
+			echo json_encode(['code' => 0, 'result' => 'category_meja_type harus billiard atau mahjong']);
+			return;
+		}
+
 		$data = array();
 		if (!empty($body['category_meja_name'])) $data['category_meja_name'] = trim($body['category_meja_name']);
 		if ($price !== null) $data['category_meja_price'] = $price;
+		if ($type !== null) $data['category_meja_type'] = $type;
 		if (!empty($active)) $data['category_meja_active'] = $active;
 
 		if (isset($data['category_meja_name']) && $this->setting_model->is_category_meja_name_exists($data['category_meja_name'], $category_meja_id)) {

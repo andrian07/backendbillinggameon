@@ -801,6 +801,54 @@ class Master extends CI_Controller {
 		}
 	}
 
+	// sama seperti price_list()/edit_price() di atas, tapi baca/tulis ms_master_price_mahjong
+	// (tabel harga terpisah untuk kategori meja bertipe mahjong - lihat category_meja_type)
+	public function price_list_mahjong()
+	{
+		$body = $this->_post_body();
+		if ($body === null) return;
+
+		$data = $this->master_model->get_price_list('ms_master_price_mahjong');
+		echo json_encode(['data' => $data]);
+	}
+
+	public function edit_price_mahjong()
+	{
+		$body = $this->_post_body();
+		if ($body === null) return;
+
+		$master_price_id = isset($body['master_price_id']) ? (int) $body['master_price_id'] : 0;
+		if ($master_price_id <= 0) {
+			echo json_encode(['code' => 0, 'result' => 'master_price_id wajib diisi']);
+			return;
+		}
+
+		$editable_fields = array(
+			'price' => 'master_price_price',
+			'price_2' => 'master_price_price_2',
+			'price_3' => 'master_price_price_3',
+			'price_4' => 'master_price_price_4',
+			'price_5' => 'master_price_price_5',
+		);
+
+		$data = array();
+		foreach ($editable_fields as $field => $column) {
+			if (isset($body[$field])) $data[$column] = (int) $body[$field];
+		}
+
+		if (empty($data)) {
+			echo json_encode(['code' => 0, 'result' => 'Tidak ada data yang diubah']);
+			return;
+		}
+
+		$success = $this->master_model->edit_price($master_price_id, $data, 'ms_master_price_mahjong');
+		if ($success) {
+			echo json_encode(['code' => 200, 'result' => 'Harga berhasil diubah']);
+		} else {
+			echo json_encode(['code' => 0, 'result' => 'Gagal mengubah harga']);
+		}
+	}
+
 	/**
 	 * End master price
 	 */
@@ -903,6 +951,11 @@ class Master extends CI_Controller {
 		// category_ids: daftar category_meja_id yang promo ini boleh dipakai. KOSONG / tidak dikirim =
 		// berlaku untuk SEMUA kategori meja (perilaku lama, kompatibel).
 		$category_ids = (isset($body['category_ids']) && is_array($body['category_ids'])) ? $body['category_ids'] : array();
+		$table_type = isset($body['ms_promo_table_type']) ? $body['ms_promo_table_type'] : 'billiard';
+		if (!in_array($table_type, array('billiard', 'mahjong'), true)) {
+			echo json_encode(['code' => 0, 'result' => 'ms_promo_table_type harus billiard atau mahjong']);
+			return;
+		}
 
 		if ($name === '' || $tipe === '' || $value === '') {
 			echo json_encode(['code' => 0, 'result' => 'ms_promo_name, ms_promo_tipe, ms_promo_value wajib diisi']);
@@ -941,7 +994,8 @@ class Master extends CI_Controller {
 			$name, $tipe, (int) $value, $tipe === 'Fix' ? (int) $hour : null,
 			$schedule['valid_days'], $schedule['valid_time_start'], $schedule['valid_time_end'],
 			$tipe === 'Fix' ? $free_hour : null,
-			$category_ids
+			$category_ids,
+			$table_type
 		);
 		if ($promo_id) {
 			echo json_encode(['code' => 200, 'result' => 'Promo berhasil ditambahkan', 'promo_id' => $promo_id]);
@@ -969,6 +1023,13 @@ class Master extends CI_Controller {
 		$data = array();
 		if (!empty($body['ms_promo_name'])) $data['ms_promo_name'] = $this->_normalize_name($body['ms_promo_name']);
 		if (!empty($body['ms_promo_tipe'])) $data['ms_promo_tipe'] = $body['ms_promo_tipe'];
+		if (isset($body['ms_promo_table_type'])) {
+			if (!in_array($body['ms_promo_table_type'], array('billiard', 'mahjong'), true)) {
+				echo json_encode(['code' => 0, 'result' => 'ms_promo_table_type harus billiard atau mahjong']);
+				return;
+			}
+			$data['ms_promo_table_type'] = $body['ms_promo_table_type'];
+		}
 		if (isset($body['ms_promo_value'])) $data['ms_promo_value'] = (int) $body['ms_promo_value'];
 		if (isset($body['hour'])) $data['hour'] = $body['hour'] !== '' ? (int) $body['hour'] : null;
 		if (isset($body['free_hour'])) $data['free_hour'] = $body['free_hour'] !== '' ? (int) $body['free_hour'] : null;

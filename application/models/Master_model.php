@@ -546,9 +546,11 @@ class master_model extends CI_Model {
     // 100% lewat gameon (Gameon::deduct_saldo / refund_saldo, atomik + idempoten via deduction_ref).
     // billing_api tidak lagi menyentuh ms_customer.customer_saldo sama sekali.
 
-    public function get_price_list() {
+    // $table: 'ms_master_price' (billiard, default) atau 'ms_master_price_mahjong' - struktur
+    // kedua tabel identik (168 baris hari x jam, 5 kolom tier harga), cuma datanya independen.
+    public function get_price_list($table = 'ms_master_price') {
         $this->db->order_by('master_price_id', 'ASC');
-        $query = $this->db->get('ms_master_price');
+        $query = $this->db->get($table);
 
         $data = array();
         foreach ($query->result() as $row) {
@@ -567,15 +569,15 @@ class master_model extends CI_Model {
         return $data;
     }
 
-    public function get_price_by_id($master_price_id) {
+    public function get_price_by_id($master_price_id, $table = 'ms_master_price') {
         $this->db->where('master_price_id', $master_price_id);
-        return $this->db->get('ms_master_price')->row();
+        return $this->db->get($table)->row();
     }
 
-    public function edit_price($master_price_id, $data) {
-        if (!$this->get_price_by_id($master_price_id)) return false;
+    public function edit_price($master_price_id, $data, $table = 'ms_master_price') {
+        if (!$this->get_price_by_id($master_price_id, $table)) return false;
         $this->db->where('master_price_id', $master_price_id);
-        return $this->db->update('ms_master_price', $data);
+        return $this->db->update($table, $data);
     }
 
     public function get_payment_list() {
@@ -662,6 +664,11 @@ class master_model extends CI_Model {
     // dipakai Billing_model - true kalau promo boleh dipakai untuk $category_meja_id (atau promo
     // tidak dibatasi kategori sama sekali)
     public function promo_category_ok($promo_id, $category_meja_id) {
+        // jenis promo (billiard/mahjong) harus sama dengan jenis kategori meja
+        $promo = $this->get_promo_by_id($promo_id);
+        $cat = $this->db->select('category_meja_type')->where('category_meja_id', (int) $category_meja_id)->get('category_meja')->row();
+        if ($promo && $cat && $promo->ms_promo_table_type !== $cat->category_meja_type) return false;
+
         $ids = $this->get_promo_category_ids($promo_id);
         if (empty($ids)) return true;
         return in_array((int) $category_meja_id, $ids, true);
@@ -672,6 +679,7 @@ class master_model extends CI_Model {
             'id' => (int) $row->ms_promo_id,
             'name' => $row->ms_promo_name,
             'tipe' => $row->ms_promo_tipe,
+            'table_type' => $row->ms_promo_table_type,
             'value' => (int) $row->ms_promo_value,
             'hour' => $row->hour !== null ? (int) $row->hour : null,
             'free_hour' => $row->free_hour !== null ? (int) $row->free_hour : null,
@@ -682,8 +690,9 @@ class master_model extends CI_Model {
         );
     }
 
-    public function add_promo($name, $tipe, $value, $hour = null, $valid_days = null, $valid_time_start = null, $valid_time_end = null, $free_hour = null, $category_ids = null) {
+    public function add_promo($name, $tipe, $value, $hour = null, $valid_days = null, $valid_time_start = null, $valid_time_end = null, $free_hour = null, $category_ids = null, $table_type = 'billiard') {
         $data = array(
+            'ms_promo_table_type' => $table_type,
             'ms_promo_name' => $name,
             'ms_promo_tipe' => $tipe,
             'ms_promo_value' => $value,

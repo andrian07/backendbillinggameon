@@ -6,9 +6,16 @@ class billing_model extends CI_Model {
         parent::__construct();
     }
 
-    public function get_table_list() {
-        $this->db->select('*');
+    // $table_type: null = semua meja (dipakai Sync/laporan dkk), 'billiard'/'mahjong' = filter
+    // langsung di WHERE (dipakai halaman Billing & Mahjong, lihat Billing::get_table_list())
+    public function get_table_list($table_type = null) {
+        // table_type (billiard/mahjong) sekarang kolom langsung di table_active (bukan JOIN ke
+        // category_meja lagi) - di-sync otomatis tiap table_category diubah, lihat
+        // update_setting_table() di bawah. Di-alias 'category_type' di output karena itu nama
+        // field yang sudah dipakai Flutter (PoolTable.categoryType).
+        $this->db->select('*, table_type AS category_type', false);
         $this->db->where('is_active', 1);
+        if ($table_type !== null) $this->db->where('table_type', $table_type);
         $query = $this->db->get('table_active');
         return $query->result();
     }
@@ -181,6 +188,8 @@ class billing_model extends CI_Model {
             'date' => $row->transaction_date,
             'mode' => $row->transaction_mode,
             'customer_id' => $row->transaction_customer_id !== null ? (int) $row->transaction_customer_id : null,
+            'players' => isset($row->transaction_players) ? $row->transaction_players : null,
+            'player_ids' => isset($row->transaction_player_ids) ? $row->transaction_player_ids : null,
             'payment_id' => (int) $row->transaction_payment_id,
             'promo_id' => (int) $row->transaction_promo_id,
             'start_time' => $row->transaction_start_time,
@@ -201,6 +210,11 @@ class billing_model extends CI_Model {
             'paid_by' => (int) $row->paid_by,
             'payment_edited_by' => $row->transaction_payment_edited_by,
             'payment_edited_at' => $row->transaction_payment_edited_at,
+            'cancelled_by' => isset($row->transaction_cancelled_by) ? $row->transaction_cancelled_by : null,
+            'cancelled_at' => isset($row->transaction_cancelled_at) ? $row->transaction_cancelled_at : null,
+            // billiard/mahjong - snapshot yang disimpan add_transaction() saat payment(), dipakai
+            // Flutter buat filter tab Transaksi (lihat TransactionPage)
+            'category_type' => $row->transaction_category_type,
         );
     }
 
@@ -337,6 +351,52 @@ class billing_model extends CI_Model {
         if (!$this->db->trans_status()) return false;
 
         return true;
+    }
+
+    // batalkan transaksi billing yang SUDAH "Done" (beda dari cancel_table() yang membatalkan MEJA
+    // yang masih aktif dalam 6 menit pertama - ini untuk transaksi yang sudah tercatat di riwayat).
+    // Ditolak untuk metode "Potong Saldo" atau transaction_type "Gunakan Timer" (dibayar pakai waktu
+    // tersimpan) - saldo/waktu customer sudah benar-benar terpotong di gameon saat payment() dan
+    // deduction_ref-nya tidak disimpan ke tabel transaction, jadi tidak ada cara aman merefund-nya
+    // otomatis di sini (sama seperti guard SALDO_NOT_ALLOWED di edit_payment_transaction() di atas).
+    // Poin member juga TIDAK direfund (tidak ada endpoint pengurangan poin di gameon) - konsisten
+    // dengan keputusan yang sudah dipakai di Cafe_model::cancel_transaction_cafe() (saldo juga tidak
+    // direfund di sana). Status meja TIDAK disentuh - meja mungkin sudah lama dipakai sesi lain sejak
+    // transaksi ini dibuat, beda dari cancel_table() yang mejanya masih dalam sesi yang sama.
+    public function cancel_transaction($transaction_id, $created_by) {
+        $this->db->where('transaction_id', $transaction_id);
+        $transaction = $this->db->get('transaction')->row();
+        if (!$transaction) return 'NOT_FOUND';
+        if (strtolower($transaction->transaction_status) === 'cancel') return 'ALREADY_CANCELLED';
+
+        $payment = $transaction->transaction_payment_id
+            ? $this->db->where('payment_id', $transaction->transaction_payment_id)->get('ms_payment')->row()
+            : null;
+        if ($payment && $payment->payment_name === 'Potong Saldo') return 'SALDO_NOT_ALLOWED';
+        if (strtolower((string) $transaction->transaction_type) === strtolower('Gunakan Timer')) {
+            return 'SAVED_TIME_NOT_ALLOWED';
+        }
+
+        $this->db->trans_start();
+
+        // UPDATE bersyarat (status != Cancel) atomik, sama pola dengan claim_table_for_payment() &
+        // Cafe_model::cancel_transaction_cafe() - jaga-jaga kalau tombol Cancel diklik dua kali
+        // nyaris bersamaan, cuma satu yang berhasil memproses.
+        $this->db->where('transaction_id', $transaction_id);
+        $this->db->where('transaction_status !=', 'Cancel');
+        $this->db->update('transaction', array(
+            'transaction_status' => 'Cancel',
+            'transaction_cancelled_by' => $created_by,
+            'transaction_cancelled_at' => date('Y-m-d H:i:s'),
+        ));
+
+        if ($this->db->affected_rows() <= 0) {
+            $this->db->trans_complete();
+            return 'ALREADY_CANCELLED';
+        }
+
+        $this->db->trans_complete();
+        return $this->db->trans_status() ? true : false;
     }
 
     private function map_transaction_saldo($row) {
@@ -487,6 +547,63 @@ class billing_model extends CI_Model {
         return $this->db->get('ms_customer')->row();
     }
 
+    // Validasi & resolve daftar pemain mahjong (maks 4, harus member terdaftar) dari
+    // $player_ids_raw ("12,34,56", dikirim client) - dipakai book_table(). Return array
+    // ['ids' => 'id1,id2,...'|null, 'names' => 'Nama1, Nama2, ...'|null] kalau valid, atau
+    // string pesan error kalau tidak (dedup, lebih dari 4, member tidak ada, atau member
+    // itu sedang aktif di meja lain - "1 member 1 meja" berlaku lintas billiard & mahjong).
+    public function resolve_players($player_ids_raw, $exclude_table_id) {
+        $ids = array();
+        foreach (explode(',', (string) $player_ids_raw) as $raw) {
+            $id = (int) trim($raw);
+            if ($id > 0) $ids[] = $id;
+        }
+        if (empty($ids)) return array('ids' => null, 'names' => null);
+
+        if (count($ids) > 4) {
+            return 'Maksimal 4 pemain per meja';
+        }
+        if (count($ids) !== count(array_unique($ids))) {
+            return 'Tidak boleh memilih member yang sama lebih dari sekali di meja ini';
+        }
+
+        $names = array();
+        foreach ($ids as $id) {
+            $customer = $this->get_customer_detail($id);
+            if (!$customer) return 'Salah satu pemain tidak ditemukan sebagai member';
+            $names[] = $customer->customer_name;
+        }
+
+        // "1 member 1 meja": cek member yang dipilih tidak sedang aktif (table_active=1) di meja
+        // lain - baik sebagai member utama (table_customer_id) maupun sebagai salah satu pemain
+        // mahjong (table_player_ids) meja lain. table_player_ids disimpan sebagai teks dipisah
+        // koma, jadi dicocokkan di PHP (bukan SQL IN) setelah baris aktifnya diambil.
+        $this->db->select('table_id, table_number, table_customer_id, table_player_ids');
+        $this->db->where('table_active', 1);
+        $this->db->where('table_id !=', $exclude_table_id);
+        $active_tables = $this->db->get('table_active')->result();
+
+        foreach ($active_tables as $t) {
+            $occupied = array();
+            if (!empty($t->table_customer_id)) $occupied[] = (int) $t->table_customer_id;
+            if (!empty($t->table_player_ids)) {
+                foreach (explode(',', $t->table_player_ids) as $raw) {
+                    $id = (int) trim($raw);
+                    if ($id > 0) $occupied[] = $id;
+                }
+            }
+            $clash = array_intersect($ids, $occupied);
+            if (!empty($clash)) {
+                $clash_id = reset($clash);
+                $clash_index = array_search($clash_id, $ids, true);
+                $clash_name = $names[$clash_index];
+                return $clash_name . ' sedang aktif di meja ' . $t->table_number . ' - 1 member cuma bisa main di 1 meja';
+            }
+        }
+
+        return array('ids' => implode(',', $ids), 'names' => implode(', ', $names));
+    }
+
     public function book_table($table_id, $data) {
         if (!$this->get_table_by_id($table_id)) return false;
         $this->db->where('table_id', $table_id);
@@ -499,7 +616,7 @@ class billing_model extends CI_Model {
     }
 
     public function get_setting_table() {
-        $this->db->select('table_id, relay_number, table_number, table_point, table_category, table_active, category_meja_name');
+        $this->db->select('table_id, relay_number, table_number, table_point, table_category, table_active, table_type, category_meja_name');
         $this->db->join('category_meja', 'category_meja.category_meja_id = table_active.table_category', 'left');
         $this->db->where('is_active', 1);
         $this->db->order_by('table_id', 'ASC');
@@ -521,6 +638,7 @@ class billing_model extends CI_Model {
                 'table_category_id' => $category_id,
                 'table_category_name' => $category_id !== null ? $row->category_meja_name : null,
                 'table_active' => $row->table_active,
+                'table_type' => $row->table_type === 'mahjong' ? 'mahjong' : 'billiard',
             );
         }
         return $data;
@@ -532,7 +650,13 @@ class billing_model extends CI_Model {
         if (array_key_exists('table_relay', $data)) $update['relay_number'] = (int) $data['table_relay'];
         if (array_key_exists('table_number', $data)) $update['table_number'] = $data['table_number'];
         // category_meja_id selalu >= 1, jadi 0/kosong dianggap "tidak diisi" (bukan permintaan mengosongkan category) untuk mencegah ke-reset tidak sengaja
-        if (!empty($data['table_category'])) $update['table_category'] = (int) $data['table_category'];
+        if (!empty($data['table_category'])) {
+            $update['table_category'] = (int) $data['table_category'];
+            // table_type ikut disinkronkan ke jenis kategori barunya, supaya kolom cepat ini
+            // (dipakai get_table_list()) tidak pernah nyasar beda dari category_meja_type-nya
+            $category = $this->db->where('category_meja_id', $update['table_category'])->get('category_meja')->row();
+            if ($category) $update['table_type'] = $category->category_meja_type;
+        }
 
         if (empty($update)) return false;
 
@@ -573,6 +697,8 @@ class billing_model extends CI_Model {
         return array(
             'table_customer_id' => null,
             'table_customer_name' => null,
+            'table_players' => null,
+            'table_player_ids' => null,
             // table_promo_id NOT NULL di database, jadi direset ke 0
             'table_promo_id' => 0,
             'table_mode' => null,
@@ -699,17 +825,29 @@ class billing_model extends CI_Model {
             'transaction_date' => date('Y-m-d'),
             'transaction_mode' => $data['mode'],
             'transaction_customer_id' => $data['customer_id'],
+            'transaction_players' => isset($data['players']) ? $data['players'] : null,
+            'transaction_player_ids' => isset($data['player_ids']) ? $data['player_ids'] : null,
             'transaction_payment_id' => $data['payment_id'],
             'transaction_promo_id' => $data['promo_id'],
             'transaction_start_time' => $data['start_time'],
             'transaction_end_time' => $data['end_time'],
             'transaction_duration' => $data['duration'],
             'transaction_sub_total' => $data['sub_total'],
-            'transaction_discount' => $this->calculate_discount($data['promo_id'], $data['total_bill']),
+            // nominal diskon riil - dihitung sekali di calculate_price() (lihat total_promo di
+            // sana, termasuk promo Fix yang sekarang dihitung dari selisih harga normal vs harga
+            // paket) dan diteruskan payment() ke sini, bukan dihitung ulang - calculate_discount()
+            // di bawah cuma fallback kalau caller lain (tidak ada saat ini) belum menghitungnya.
+            'transaction_discount' => isset($data['total_promo'])
+                ? (int) $data['total_promo']
+                : $this->calculate_discount($data['promo_id'], $data['total_bill']),
             'transaction_tax' => $data['tax'],
             'transaction_total_bill' => $data['total_bill'],
             'transaction_saved_time_value' => isset($data['saved_time_value']) ? $data['saved_time_value'] : null,
             'transaction_table' => $data['table'],
+            // snapshot jenis kategori meja SAAT transaksi terjadi (bukan lookup langsung ke
+            // table_active.table_category saat laporan dibuat) - supaya laporan historis tetap
+            // akurat walau kategori meja itu diubah/dipindah belakangan.
+            'transaction_category_type' => !empty($data['category_type']) ? $data['category_type'] : 'billiard',
             'transaction_status' => 'Done',
             'transaction_type' => !empty($data['payment_type']) ? $data['payment_type'] : 'Normal',
             'created_by' => $data['created_by'],
@@ -760,26 +898,34 @@ class billing_model extends CI_Model {
         return $this->db->trans_status() ? $transaction_id : false;
     }
 
-    // category_meja_price (1-5) menentukan kolom harga ms_master_price yang dipakai:
-    // 1 = master_price_price, 2 = master_price_price_2, dst sampai 5 = master_price_price_5
+    // category_meja_price (1-5) menentukan kolom harga yang dipakai (1 = master_price_price, dst
+    // sampai 5 = master_price_price_5), dan category_meja_type menentukan TABEL-nya: billiard
+    // baca/tulis ms_master_price, mahjong baca/tulis ms_master_price_mahjong (tabel terpisah -
+    // 5 slot tier billiard sudah terpakai semua oleh kategori billiard yang ada). Return array
+    // ['tier' => 1-5, 'type' => 'billiard'|'mahjong'] supaya kedua nilai selalu diambil bersamaan
+    // dari baris category_meja yang sama (hindari 2 query terpisah yang bisa saja tidak konsisten).
     public function get_category_meja_price_tier($category_meja_id) {
-        if (empty($category_meja_id)) return 1;
+        if (empty($category_meja_id)) return array('tier' => 1, 'type' => 'billiard');
 
         $this->db->where('category_meja_id', $category_meja_id);
         $row = $this->db->get('category_meja')->row();
-        if (!$row || empty($row->category_meja_price)) return 1;
+        if (!$row) return array('tier' => 1, 'type' => 'billiard');
 
-        $tier = (int) $row->category_meja_price;
-        return in_array($tier, array(1, 2, 3, 4, 5)) ? $tier : 1;
+        $tier = !empty($row->category_meja_price) ? (int) $row->category_meja_price : 1;
+        $tier = in_array($tier, array(1, 2, 3, 4, 5)) ? $tier : 1;
+        $type = $row->category_meja_type === 'mahjong' ? 'mahjong' : 'billiard';
+
+        return array('tier' => $tier, 'type' => $type);
     }
 
-    private function get_price_per_hour($day, $hour, $price_tier = 1) {
+    private function get_price_per_hour($day, $hour, $price_tier = 1, $category_type = 'billiard') {
         $price_column = $price_tier > 1 ? 'master_price_price_' . $price_tier : 'master_price_price';
+        $table = $category_type === 'mahjong' ? 'ms_master_price_mahjong' : 'ms_master_price';
 
         $this->db->select($price_column, false);
         $this->db->where('master_price_days', $day);
         $this->db->where('master_price_time', $hour);
-        $row = $this->db->get('ms_master_price')->row();
+        $row = $this->db->get($table)->row();
         return $row ? (int) $row->$price_column : 0;
     }
 
@@ -792,7 +938,7 @@ class billing_model extends CI_Model {
         return in_array($step, array(1, 6)) ? $step : 1;
     }
 
-    private function calculate_billing($start_time, $end_time, $price_tier = 1) {
+    private function calculate_billing($start_time, $end_time, $price_tier = 1, $category_type = 'billiard') {
         $start_ts = strtotime($start_time);
         $end_ts = strtotime($end_time);
         $total_minutes = (int) floor(($end_ts - $start_ts) / 60);
@@ -815,7 +961,7 @@ class billing_model extends CI_Model {
             $minute_into_hour = (int) floor(($cursor_ts - $hour_start) / 60);
             $minutes_in_hour = min(60 - $minute_into_hour, $minutes_left);
 
-            $price_per_hour = $this->get_price_per_hour(date('l', $cursor_ts), (int) date('G', $cursor_ts), $price_tier);
+            $price_per_hour = $this->get_price_per_hour(date('l', $cursor_ts), (int) date('G', $cursor_ts), $price_tier, $category_type);
             $total += ($price_per_hour / 60) * $minutes_in_hour;
 
             $cursor_ts += $minutes_in_hour * 60;
@@ -881,7 +1027,7 @@ class billing_model extends CI_Model {
         return null;
     }
 
-    public function calculate_price($start_time, $end_time, $promo_id, $price_tier = 1, $mode = null) {
+    public function calculate_price($start_time, $end_time, $promo_id, $price_tier = 1, $mode = null, $category_type = 'billiard') {
         $promo = !empty($promo_id) ? $this->db->where('ms_promo_id', $promo_id)->get('ms_promo')->row() : null;
 
         $promo_rejected_reason = null;
@@ -913,14 +1059,20 @@ class billing_model extends CI_Model {
         }
 
         if ($promo && $promo->ms_promo_tipe === 'Fix') {
-            // promo Fix: subtotal & total sudah ditentukan oleh ms_promo_value, tidak dihitung ulang, tidak ada diskon.
-            // dibatasi minimal 0 supaya promo dengan nilai negatif tidak membuat tagihan minus (sistem "membayar" customer)
-            $total_billing = max(0, (int) $promo->ms_promo_value);
+            // promo Fix: yang ditagih SELALU ms_promo_value (tidak dihitung ulang per jam) - dibatasi
+            // minimal 0 supaya promo dengan nilai negatif tidak membuat tagihan minus (sistem
+            // "membayar" customer). Tapi buat "Diskon" yang tampil di nota, hitung juga harga NORMAL
+            // (seandainya tanpa promo) supaya selisihnya (harga normal - harga paket) berarti sebagai
+            // nominal diskon - sebelum ini total_promo selalu 0 untuk promo Fix, jadi nota tidak pernah
+            // menunjukkan berapa yang sebenarnya dihemat customer, cuma nama promonya saja.
             $total_transaksi = max(0, (int) $promo->ms_promo_value);
+            $normal_price = $this->calculate_billing($start_time, $end_time, $price_tier, $category_type);
+            $total_promo = max(0, $normal_price - $total_transaksi);
+            $total_billing = $normal_price;
 
             return array(
                 'total_billing' => $total_billing,
-                'total_promo' => 0,
+                'total_promo' => $total_promo,
                 'total_tax' => 0,
                 'total_pembulatan' => 0,
                 'total_transaksi' => $total_transaksi,
@@ -928,7 +1080,7 @@ class billing_model extends CI_Model {
             );
         }
 
-        $total_billing = $this->calculate_billing($start_time, $end_time, $price_tier);
+        $total_billing = $this->calculate_billing($start_time, $end_time, $price_tier, $category_type);
         $total_promo = $this->calculate_discount($promo_id, $total_billing);
         $total_tax = 0;
 

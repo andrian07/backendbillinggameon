@@ -100,6 +100,7 @@ class Setting_model extends CI_Model {
         return array(
             'id' => (int) $row->category_meja_id,
             'name' => $row->category_meja_name,
+            'type' => $row->category_meja_type,
             'price' => (int) $row->category_meja_price,
             'active' => $row->category_meja_active,
         );
@@ -138,9 +139,10 @@ class Setting_model extends CI_Model {
         );
     }
 
-    public function add_category_meja($name, $price = 1) {
+    public function add_category_meja($name, $price = 1, $type = 'billiard') {
         $data = array(
             'category_meja_name' => $name,
+            'category_meja_type' => $type,
             'category_meja_price' => $price,
             'category_meja_active' => 'Y',
         );
